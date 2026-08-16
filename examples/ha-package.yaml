@@ -72,6 +72,36 @@ input_button:
     icon: mdi:stop-circle-outline
 
 # ------------------------------------------------------------------------------
+# script: friendly-named wrappers around the scheduler's pyscript actions.
+# HA action ids must be slugs (pyscript registers them as
+# `pyscript.irrigation_*`), so these scripts give you human display names
+# ("Irrigation: Preview") in Developer Tools -> Actions and on dashboards,
+# while just forwarding to the underlying pyscript action. Optional — delete
+# any you don't want; the pyscript actions work with or without them.
+# ------------------------------------------------------------------------------
+script:
+  irrigation_run_now:
+    alias: "Irrigation: Run Now"
+    icon: mdi:play-circle-outline
+    sequence:
+      - action: pyscript.irrigation_run_now
+  irrigation_preview:
+    alias: "Irrigation: Preview"
+    icon: mdi:eye-outline
+    sequence:
+      - action: pyscript.irrigation_preview
+  irrigation_stop:
+    alias: "Irrigation: Stop"
+    icon: mdi:stop-circle-outline
+    sequence:
+      - action: pyscript.irrigation_stop
+  irrigation_refresh_runtimes:
+    alias: "Irrigation: Refresh Runtimes"
+    icon: mdi:refresh
+    sequence:
+      - action: pyscript.irrigation_refresh_runtimes
+
+# ------------------------------------------------------------------------------
 # sensor: `statistics` platform sensors computing the "observed overnight"
 # means the scheduler compares against forecast to decide skip logic. Each
 # sources a WeatherFlow Tempest entity over a rolling 6-hour `max_age` window

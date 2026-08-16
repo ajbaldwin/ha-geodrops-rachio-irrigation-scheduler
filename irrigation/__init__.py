@@ -1675,6 +1675,7 @@ def irrigation_preview():
 
 @service
 def irrigation_stop():
+    """Manually stop the run in progress: aborts the plan and closes any open zones."""
     global _manual_stop
     _manual_stop = True
     _activity("Manual stop requested")
