@@ -1,0 +1,223 @@
+# ==============================================================================
+# GeoDrops Scheduler — example config.yaml
+# ==============================================================================
+# Copy this file to `config.yaml` in the same directory the app reads from and
+# edit the sections marked EDIT ME. Every value in this file is a placeholder;
+# nothing here refers to a real Home Assistant entity, Rachio zone, or install.
+#
+# Sections you should NOT need to touch:
+#   - bands              (soil-moisture band boundaries — agronomy, not site-specific)
+#   - tunables            (scheduling knobs — sane defaults for most yards)
+#   - drought_profiles    (Massachusetts drought-rating levels — the KEYS are
+#                          matched by exact string against your
+#                          input_select.irrigation_drought_level options; do not
+#                          rename them unless you also rename that helper's
+#                          options to match)
+#
+# Sections you MUST edit for your own install:
+#   - homeassistant       (every entity_id / service the app talks to)
+#   - zones               (one entry per Rachio zone you want scheduled)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# bands: soil-moisture percentage ranges used to describe a zone's state.
+# `low` is inclusive, `high` is exclusive (except the top band, which is
+# inclusive of 100). Leave as-is unless you have a specific reason to redefine
+# what "moist" means for your soil.
+# ------------------------------------------------------------------------------
+bands:
+  dry:        {low: 0,   high: 62}
+  dry_plus:   {low: 62,  high: 67}
+  moist:      {low: 67,  high: 76}
+  moist_plus: {low: 76,  high: 87}
+  wet:        {low: 87,  high: 95}
+  wet_plus:   {low: 95,  high: 100}
+
+# ------------------------------------------------------------------------------
+# tunables: scheduling and safety-gate knobs. These are the shipped defaults;
+# they are not private to any one install and are reasonable starting points.
+# ------------------------------------------------------------------------------
+tunables:
+  cycle_minutes: 12
+  soak_minutes: 20
+  end_offset_minutes: 1        # finish this many minutes before the window's end anchor
+  window_base_cap_hours: 6
+  window_disease_cap_hours: 3
+  warm_temp_f: 68
+  # Retuned for overnight forecast MEANS (not a single snapshot): overnight is
+  # systematically calmer and more humid, so a naive 85/5 threshold would fire
+  # nearly every night.
+  humid_rh_pct: 90
+  stagnant_wind_mph: 2
+  # Rain-gauge threshold. Also doubles as the spray-zone corroboration: while a
+  # zone flagged `spray: true` is running, "rain" is only believed if the gauge
+  # clears this (or it is hail), because a weather station can misread that
+  # zone's overspray as rain at gauge readings near 0.
+  rain_last_hour_mm: 0.2
+  rain_sustain_seconds: 150   # plain rain must persist this long before aborting a run
+  # Forecast rain skip: skip watering when forecast rain delivers at least this
+  # fraction of a full refill, at or above this confidence.
+  rain_skip_probability_pct: 70
+  rain_skip_refill_fraction: 0.5
+
+# ------------------------------------------------------------------------------
+# drought_profiles: keys MUST match your input_select.irrigation_drought_level
+# options EXACTLY (string equality). A mismatch silently falls back to
+# "Level 3 - Critical". Names follow the Massachusetts drought rating levels;
+# rename them only if you also rename the matching helper's options.
+#
+# target_offset shifts the target band (moist=2, so -1 => dry_plus, -2 => dry);
+# trigger_margin lowers the trigger floor further; runtime_scale caps volume.
+# rain_skip_horizon_hours: how far ahead to look for substituting rain. Drier
+# levels tolerate a dry day, so they look further and skip more readily.
+# end_anchor: which sun event the window ends before. Levels 0-2 finish at
+# sunrise, so watering ends just as drying begins; Level 3 finishes at dawn,
+# before any sun, to minimise evaporative loss when water is scarce.
+# ------------------------------------------------------------------------------
+drought_profiles:
+  "Level 0 - Normal":      {target_offset: 0,  trigger_margin: 0, runtime_scale: 1.0, rain_skip_horizon_hours: 12, end_anchor: sunrise}
+  "Level 1 - Mild":        {target_offset: 0,  trigger_margin: 2, runtime_scale: 0.9, rain_skip_horizon_hours: 18, end_anchor: sunrise}
+  "Level 2 - Significant": {target_offset: -1, trigger_margin: 4, runtime_scale: 0.8, rain_skip_horizon_hours: 24, end_anchor: sunrise}
+  "Level 3 - Critical":    {target_offset: -1, trigger_margin: 6, runtime_scale: 0.7, rain_skip_horizon_hours: 24, end_anchor: dawn}
+  # Emergency: NEVER waters. offset -2 puts the target in the `dry` band whose
+  # low is 0, so the trigger floor is 0 and "dominant < 0" can never be true.
+  # This is deliberate — at a state Emergency rating the lawn is allowed to die.
+  "Level 4 - Emergency":   {target_offset: -2, trigger_margin: 0, runtime_scale: 0.5, rain_skip_horizon_hours: 24, end_anchor: dawn}
+
+# ------------------------------------------------------------------------------
+# homeassistant: EDIT ME. Every entity_id and service the app reads or calls,
+# in one place. Replace every placeholder below with the real entity_ids from
+# your own Home Assistant instance. Any key you omit falls back to the app's
+# built-in default (shown in comments) — the `weather` defaults in particular
+# assume a Tempest weather station and are fine to leave as-is if you also use
+# one; otherwise point them at your own temperature/humidity/wind sensors.
+# ------------------------------------------------------------------------------
+homeassistant:
+  # notify.* service the app calls to send you status/action notifications.
+  notify_service: notify.YOUR_PHONE
+  # Calendar entity the app logs completed/skipped watering runs to (create a
+  # Local Calendar helper in HA and point this at it).
+  calendar_entity: calendar.YOUR_CALENDAR
+  # Name of the secret in secrets.yaml holding your Rachio API key.
+  rachio_api_key_secret: rachio_api_key
+  # input_select whose options are the drought_profiles keys above, EXACTLY.
+  drought_level_select: input_select.irrigation_drought_level
+  # input_boolean that, when on, suppresses all scheduled watering.
+  standby_boolean: input_boolean.irrigation_standby
+  # switch that mirrors/drives standby_boolean at the Rachio controller.
+  standby_switch: switch.sprinkler_standby
+  # input_boolean the app sets when dew is detected (blocks disease-risk watering).
+  dew_formed_boolean: input_boolean.dew_formed
+
+  # Weather station entities. Defaults below assume a WeatherFlow Tempest;
+  # override with your own station's entities if different.
+  weather:
+    temperature: sensor.tempest_sensor_temperature
+    humidity: sensor.tempest_sensor_humidity
+    wind: sensor.tempest_sensor_wind_speed_average
+    rain_last_hour: sensor.tempest_rain_last_hour
+    precip_type: sensor.tempest_sensor_precipitation_type
+
+  # Sun-event sensors used as watering-window end anchors.
+  sun:
+    dawn: sensor.sun_next_dawn
+    sunrise: sensor.sun_next_rising
+
+  # Forecast/observed overnight derived sensors and precipitation-chance /
+  # precipitation-amount sensor-name prefixes (the app appends an hour count,
+  # e.g. `sensor.precipitation_chance_3_hour`).
+  derived:
+    forecast_overnight:
+      temp: sensor.forecast_overnight_temp
+      humidity: sensor.forecast_overnight_humidity
+      wind: sensor.forecast_overnight_wind
+    observed_overnight:
+      temp: sensor.observed_overnight_temp
+      humidity: sensor.observed_overnight_humidity
+      wind: sensor.observed_overnight_wind
+    precipitation_chance_prefix: sensor.precipitation_chance_
+    precipitation_amount_prefix: sensor.precipitation_amount_
+
+# ------------------------------------------------------------------------------
+# zones: EDIT ME. One entry per Rachio zone you want the scheduler to manage.
+# The three zones below are illustrative placeholders, not a template you must
+# match exactly — add, remove, or rename zones to fit your own yard. Every
+# zone needs ALL of the keys shown; none may be omitted.
+#
+# Key reference:
+#   rachio_switch     switch entity Rachio exposes for this zone
+#   dominant_sensor    the moisture sensor whose reading is trusted for this
+#                       zone (percent, 0-100)
+#   state_sensor        sensor publishing the zone's Dry/Dry+/Moist/.../Wet+
+#                       text state
+#   quality_sensors    list of per-depth QC sensors backing dominant_sensor;
+#                       at least one is expected, most yards use three (shallow/
+#                       mid/deep)
+#   target_range        which `bands` key this zone is scheduled to
+#   geography            free-text grouping (e.g. front/back) used only for
+#                       your own organization; not matched against anything
+#   adjacency             list of OTHER zone keys that are physically adjacent —
+#                       used to avoid watering two neighbouring zones back-to-
+#                       back (runoff protection). Keep this list SYMMETRIC: if
+#                       zone_a lists zone_b, zone_b must list zone_a back.
+#   runtime_minutes    full-refill runtime for this zone, in minutes (seed this
+#                       from the Rachio app's computed runtime for the zone)
+#   rachio_zone_id      the zone's Rachio UUID (find it via the Rachio API or
+#                       app; the placeholder below is not a real UUID)
+#   refill_depth_mm    full-refill depth in mm (Rachio's `depthOfWater`,
+#                       converted from inches: inches * 25.4)
+#   spray                 (optional, defaults to false) set `true` if this
+#                       zone's spray pattern can hit your weather station and
+#                       make it misreport spray as rain — see
+#                       tunables.rain_last_hour_mm above
+# ------------------------------------------------------------------------------
+zones:
+  zone_a:
+    rachio_switch: switch.zone_a
+    dominant_sensor: sensor.zone_a_moisture_dominant
+    state_sensor: sensor.zone_a_moisture_state
+    quality_sensors:
+      - sensor.zone_a_moisture_quality_depth_1
+      - sensor.zone_a_moisture_quality_depth_2
+      - sensor.zone_a_moisture_quality_depth_3
+    target_range: moist
+    geography: front
+    adjacency: [zone_b]
+    runtime_minutes: 45
+    rachio_zone_id: "00000000-0000-0000-0000-000000000000"
+    refill_depth_mm: 7.11
+
+  zone_b:
+    rachio_switch: switch.zone_b
+    dominant_sensor: sensor.zone_b_moisture_dominant
+    state_sensor: sensor.zone_b_moisture_state
+    quality_sensors:
+      - sensor.zone_b_moisture_quality_depth_1
+      - sensor.zone_b_moisture_quality_depth_2
+      - sensor.zone_b_moisture_quality_depth_3
+    target_range: moist
+    geography: front
+    adjacency: [zone_a]
+    runtime_minutes: 50
+    rachio_zone_id: "00000000-0000-0000-0000-000000000000"
+    refill_depth_mm: 7.11
+
+  # Illustrates a zone flagged spray: true — its overspray can hit the weather
+  # station, so the app corroborates "rain" with the physical rain gauge (see
+  # tunables.rain_last_hour_mm) instead of trusting the reported precip_type
+  # alone while this zone is running.
+  zone_c:
+    rachio_switch: switch.zone_c
+    dominant_sensor: sensor.zone_c_moisture_dominant
+    state_sensor: sensor.zone_c_moisture_state
+    quality_sensors:
+      - sensor.zone_c_moisture_quality_depth_1
+      - sensor.zone_c_moisture_quality_depth_2
+      - sensor.zone_c_moisture_quality_depth_3
+    target_range: moist
+    geography: back
+    adjacency: []
+    runtime_minutes: 60
+    rachio_zone_id: "00000000-0000-0000-0000-000000000000"
+    refill_depth_mm: 8.89
+    spray: true

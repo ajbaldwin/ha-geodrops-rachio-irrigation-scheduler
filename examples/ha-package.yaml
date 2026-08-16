@@ -1,0 +1,208 @@
+# ==============================================================================
+# GeoDrops Scheduler — Home Assistant package: scaffolding entities
+# ==============================================================================
+# Copy this file into your Home Assistant config's `packages/` directory
+# (enable packages in configuration.yaml first, if you haven't already:
+#
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# ) then restart HA (new `sensor:`/`template:` platforms and new helper
+# entities need a full restart, not just a reload). This file creates every
+# helper entity the scheduler's `homeassistant:` config block expects BY
+# DEFAULT — see the `homeassistant:` section of
+# release/geodrops-scheduler/static/examples/config.example.yaml. If you keep
+# the entity ids below unchanged, config.yaml needs zero edits for these
+# helpers to work.
+#
+# What you MUST still edit: every `weather.home` reference under the
+# `template:` section — those are placeholders standing in for whatever
+# forecast integration you actually use. Everything else here (the
+# input_select/input_boolean/input_button helpers and the `statistics`
+# sensors) works unedited as long as you have a WeatherFlow Tempest station
+# integrated; if you don't, repoint the `entity_id:` lines in the `sensor:`
+# section at your own temperature/humidity/wind sensors.
+#
+# What this file deliberately does NOT create: `switch.sprinkler_standby`
+# (comes from your Rachio integration), `sensor.sun_next_dawn` /
+# `sensor.sun_next_rising` (come from a sun-helper integration of your
+# choice), and `notify.*` / `calendar.*` targets (point config.yaml's
+# `notify_service` / `calendar_entity` at ones you already have).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# input_select: drought level. The scheduler matches this entity's state
+# against `drought_profiles` keys in config.yaml by EXACT string equality —
+# a mismatch silently falls back to "Level 3 - Critical". Do not rename these
+# options without also renaming the matching config.yaml keys.
+# ------------------------------------------------------------------------------
+input_select:
+  irrigation_drought_level:
+    name: Irrigation Drought Level
+    icon: mdi:water-percent
+    options:
+      - "Level 0 - Normal"
+      - "Level 1 - Mild"
+      - "Level 2 - Significant"
+      - "Level 3 - Critical"
+      - "Level 4 - Emergency"
+    initial: "Level 0 - Normal"
+
+# ------------------------------------------------------------------------------
+# input_boolean: manual overrides the scheduler reads on every run.
+#   irrigation_standby — when on, suppresses all scheduled watering.
+#   dew_formed         — set (by you, or your own dew-detection automation)
+#                        when dew is present; blocks disease-risk watering.
+# ------------------------------------------------------------------------------
+input_boolean:
+  irrigation_standby:
+    name: Irrigation Standby
+    icon: mdi:pause-circle-outline
+  dew_formed:
+    name: Dew Formed
+    icon: mdi:water-thermometer
+
+# ------------------------------------------------------------------------------
+# input_button: manual stop control. Pressing this is read by the scheduler's
+# own automations/scripts as a request to abort any in-progress run.
+# ------------------------------------------------------------------------------
+input_button:
+  irrigation_stop:
+    name: Irrigation Stop
+    icon: mdi:stop-circle-outline
+
+# ------------------------------------------------------------------------------
+# sensor: `statistics` platform sensors computing the "observed overnight"
+# means the scheduler compares against forecast to decide skip logic. Each
+# sources a WeatherFlow Tempest entity over a rolling 6-hour `max_age` window
+# — long enough to smooth out a single noisy reading, short enough to stay a
+# genuinely "overnight" mean rather than drifting into daytime data.
+#
+# The `statistics` platform derives its entity_id from `name:` (slugified),
+# so "Observed Overnight Temp" becomes `sensor.observed_overnight_temp`,
+# matching config.example.yaml's defaults exactly. If you don't have a
+# Tempest station, change only the `entity_id:` lines below to point at your
+# own temperature/humidity/wind sensors — leave `name:` alone so the
+# resulting entity_id doesn't drift from what config.yaml expects.
+# ------------------------------------------------------------------------------
+sensor:
+  - platform: statistics
+    name: "Observed Overnight Temp"
+    entity_id: sensor.tempest_sensor_temperature
+    state_characteristic: mean
+    max_age:
+      hours: 6
+
+  - platform: statistics
+    name: "Observed Overnight Humidity"
+    entity_id: sensor.tempest_sensor_humidity
+    state_characteristic: mean
+    max_age:
+      hours: 6
+
+  - platform: statistics
+    name: "Observed Overnight Wind"
+    entity_id: sensor.tempest_sensor_wind_speed_average
+    state_characteristic: mean
+    max_age:
+      hours: 6
+
+# ------------------------------------------------------------------------------
+# template: forecast-side sensors. These are illustrative scaffolding, not a
+# real forecast pipeline — every one of them reads from a `weather.home`
+# placeholder entity and is marked "CHANGE ME to your forecast entity". Point
+# each `weather.home` at your own weather integration's entity, and adjust
+# the attribute lookups below to match whatever forecast structure it
+# exposes (this simple form assumes a flat `temperature`/`humidity`/
+# `wind_speed` state attribute on the entity itself; many `weather.*`
+# integrations instead expose a `forecast` attribute that is a list of
+# hourly/daily entries — check your integration's docs and index into that
+# list instead if so).
+#
+# Like the `statistics` sensors above, entity_id is derived from `name:`
+# (slugified) — "Forecast Overnight Temp" becomes
+# `sensor.forecast_overnight_temp`, matching config.example.yaml's defaults.
+#
+# The precipitation_chance_*/precipitation_amount_* pairs are named for the
+# rain-skip horizons the shipped drought_profiles actually use (12h / 18h /
+# 24h — see rain_skip_horizon_hours in config.example.yaml). The scheduler
+# builds the entity_id it looks up at runtime as
+# f"{precipitation_chance_prefix}{horizon_hours}_hour", so the numeric
+# suffixes on these entity_ids are load-bearing, not cosmetic — if you add a
+# drought profile with a new horizon, add a matching sensor pair here.
+# ------------------------------------------------------------------------------
+template:
+  - sensor:
+      - name: "Forecast Overnight Temp"
+        unique_id: forecast_overnight_temp
+        unit_of_measurement: "°F"
+        # CHANGE ME to your forecast entity
+        state: >
+          {{ state_attr('weather.home', 'temperature') }}
+
+      - name: "Forecast Overnight Humidity"
+        unique_id: forecast_overnight_humidity
+        unit_of_measurement: "%"
+        # CHANGE ME to your forecast entity
+        state: >
+          {{ state_attr('weather.home', 'humidity') }}
+
+      - name: "Forecast Overnight Wind"
+        unique_id: forecast_overnight_wind
+        unit_of_measurement: "mph"
+        # CHANGE ME to your forecast entity
+        state: >
+          {{ state_attr('weather.home', 'wind_speed') }}
+
+      - name: "Precipitation Chance 12 Hour"
+        unique_id: precipitation_chance_12_hour
+        unit_of_measurement: "%"
+        # CHANGE ME to your forecast entity. Illustrative only: reads the
+        # first forecast entry's probability. Replace with real horizon math
+        # (e.g. max probability across the next 12h of forecast entries) for
+        # your own integration's `forecast` list shape.
+        state: >
+          {% set fc = state_attr('weather.home', 'forecast') %}
+          {{ fc[0].precipitation_probability if fc else 0 }}
+
+      - name: "Precipitation Amount 12 Hour"
+        unique_id: precipitation_amount_12_hour
+        unit_of_measurement: "mm"
+        # CHANGE ME to your forecast entity. Illustrative only — see the
+        # 12-hour chance sensor above for the same caveat about summing
+        # across the real horizon window.
+        state: >
+          {% set fc = state_attr('weather.home', 'forecast') %}
+          {{ fc[0].precipitation if fc else 0 }}
+
+      - name: "Precipitation Chance 18 Hour"
+        unique_id: precipitation_chance_18_hour
+        unit_of_measurement: "%"
+        # CHANGE ME to your forecast entity
+        state: >
+          {% set fc = state_attr('weather.home', 'forecast') %}
+          {{ fc[0].precipitation_probability if fc else 0 }}
+
+      - name: "Precipitation Amount 18 Hour"
+        unique_id: precipitation_amount_18_hour
+        unit_of_measurement: "mm"
+        # CHANGE ME to your forecast entity
+        state: >
+          {% set fc = state_attr('weather.home', 'forecast') %}
+          {{ fc[0].precipitation if fc else 0 }}
+
+      - name: "Precipitation Chance 24 Hour"
+        unique_id: precipitation_chance_24_hour
+        unit_of_measurement: "%"
+        # CHANGE ME to your forecast entity
+        state: >
+          {% set fc = state_attr('weather.home', 'forecast') %}
+          {{ fc[0].precipitation_probability if fc else 0 }}
+
+      - name: "Precipitation Amount 24 Hour"
+        unique_id: precipitation_amount_24_hour
+        unit_of_measurement: "mm"
+        # CHANGE ME to your forecast entity
+        state: >
+          {% set fc = state_attr('weather.home', 'forecast') %}
+          {{ fc[0].precipitation if fc else 0 }}
