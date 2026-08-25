@@ -119,3 +119,40 @@ def test_a_genuine_stop_is_still_caught_once_the_threshold_is_reached():
         elapsed += 30
 
     assert verdict == "external-stop"
+
+
+# ─── pause-aware abort watcher ───────────────────────────────────────────────
+
+
+def test_paused_poll_does_not_count_as_external_stop():
+    # Was watering (seen_on), now off because WE paused: no miss, no verdict.
+    verdict, seen_on, misses = abort.watch_step(
+        running=False, seen_on=True, misses=5,
+        elapsed_seconds=100, total_seconds=600,
+        confirm_seconds=90, grace_seconds=90, stop_polls=6, paused=True,
+    )
+    assert verdict is None
+    assert seen_on is True
+    assert misses == 5  # unchanged; the pause is not an anomaly
+
+
+def test_running_during_pause_flag_still_healthy():
+    verdict, seen_on, misses = abort.watch_step(
+        running=True, seen_on=True, misses=3,
+        elapsed_seconds=100, total_seconds=600,
+        confirm_seconds=90, grace_seconds=90, stop_polls=6, paused=True,
+    )
+    assert verdict is None
+    assert seen_on is True
+    assert misses == 0
+
+
+def test_default_paused_false_preserves_external_stop():
+    # Regression: existing behavior unchanged when paused omitted.
+    verdict = None
+    seen_on = True
+    misses = 5
+    verdict, seen_on, misses = abort.watch_step(
+        False, seen_on, misses, 100, 600, 90, 90, 6,
+    )
+    assert verdict == "external-stop"

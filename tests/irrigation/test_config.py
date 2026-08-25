@@ -1,4 +1,5 @@
 import pytest
+import yaml
 
 from irrigation_lib import config
 
@@ -192,3 +193,64 @@ def test_bindings_override_is_shallow_merged():
     assert b.weather.humidity == "sensor.my_rh"
     # unspecified weather keys keep their default
     assert b.weather.temperature == "sensor.tempest_sensor_temperature"
+
+
+def test_bindings_default_device_name_is_placeholder():
+    assert config.HABindings().rachio_device_name == "PLACEHOLDER"
+
+
+def test_bindings_default_run_active_boolean():
+    assert config.HABindings().run_active_boolean == "input_boolean.irrigation_run_active"
+
+
+def test_parse_bindings_reads_device_and_marker():
+    raw = {"homeassistant": {
+        "rachio_device_name": "Main House",
+        "run_active_boolean": "input_boolean.custom_marker",
+    }}
+    b = config.parse_bindings(raw)
+    assert b.rachio_device_name == "Main House"
+    assert b.run_active_boolean == "input_boolean.custom_marker"
+
+
+def test_tunables_pause_collapse_defaults():
+    t = config.Tunables()
+    assert t.use_pause_collapse is True
+    assert t.max_pause_minutes == 60
+    assert t.max_pauses_per_schedule == 0
+
+
+def test_drought_profile_end_offset_defaults_to_none():
+    p = config.DroughtProfile(target_offset=0, trigger_margin=0, runtime_scale=1.0)
+    assert p.end_offset_minutes is None
+
+
+def test_resolved_end_offset_uses_global_when_unset():
+    p = config.DroughtProfile(target_offset=0, trigger_margin=0, runtime_scale=1.0)
+    assert config.resolved_end_offset(p, 1) == 1
+
+
+def test_resolved_end_offset_uses_profile_when_set_positive():
+    p = config.DroughtProfile(target_offset=0, trigger_margin=0, runtime_scale=1.0,
+                              end_offset_minutes=15)
+    assert config.resolved_end_offset(p, 1) == 15
+
+
+def test_resolved_end_offset_uses_profile_when_negative():
+    p = config.DroughtProfile(target_offset=0, trigger_margin=0, runtime_scale=1.0,
+                              end_offset_minutes=-15)
+    assert config.resolved_end_offset(p, 1) == -15
+
+
+def test_resolved_end_offset_zero_overrides_global():
+    # 0 means "at the anchor" and must win over a nonzero global — not fall back.
+    p = config.DroughtProfile(target_offset=0, trigger_margin=0, runtime_scale=1.0,
+                              end_offset_minutes=0)
+    assert config.resolved_end_offset(p, 5) == 0
+
+
+def test_parse_config_reads_per_level_end_offset(example_config_path):
+    raw = yaml.safe_load(open(example_config_path, encoding="utf-8"))
+    raw["drought_profiles"]["Level 0 - Normal"]["end_offset_minutes"] = -15
+    cfg = config.parse_config(raw)
+    assert cfg.drought_profiles["Level 0 - Normal"].end_offset_minutes == -15

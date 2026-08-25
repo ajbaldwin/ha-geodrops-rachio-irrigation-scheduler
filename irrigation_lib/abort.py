@@ -18,11 +18,15 @@ def abort_reason(standby: bool, manual_stop: bool, rain: bool):
 
 
 def watch_step(running, seen_on, misses, elapsed_seconds, total_seconds,
-               confirm_seconds, grace_seconds, stop_polls):
+               confirm_seconds, grace_seconds, stop_polls, paused=False):
     """One poll of the in-block watch: (verdict, seen_on, misses).
 
     `verdict` is None while the block looks healthy, otherwise the reason the
-    run should end. Three guards, in this order, because they interact:
+    run should end. Four guards, in this order, because they interact:
+
+    0. **Pause guard.** When a pause we issued is active, all valves read off,
+       which is expected and not an external stop. State is held steady until
+       resume. This guard precedes the three below.
 
     1. **Never started.** Watering that has not been observed within
        `confirm_seconds` of the block being handed to Rachio did not start.
@@ -42,6 +46,10 @@ def watch_step(running, seen_on, misses, elapsed_seconds, total_seconds,
        inside a block on its own, and HA can briefly show both switches off
        across that hand-off.
     """
+    # A pause WE issued makes every valve read off; that is expected, not an
+    # external stop. Hold state steady until we resume.
+    if paused and not running:
+        return None, seen_on, misses
     if running:
         return None, True, 0
     if not seen_on:

@@ -13,8 +13,9 @@ readings instead of a fixed clock.
   drought-level setting, from normal conditions up to emergency restrictions.
 - Skips watering entirely when the forecast calls for enough rain to do the
   job for you.
-- Times each run to finish before sunrise, keeping leaf-wetness time short to
-  limit fungal/disease risk on turf.
+- Finishes each run near dawn or sunrise — the anchor and an offset are set
+  per drought level — keeping leaf-wetness time short to limit fungal/disease
+  risk on turf.
 - Runs zones in blocks (cycle + soak), rather than one long soak, for better
   infiltration.
 - Aborts a run in progress if the Tempest weather station's rain gauge
@@ -35,6 +36,13 @@ readings instead of a fixed clock.
   live rain/wind/temperature/humidity readings.
 - A forecast `weather.*` entity (e.g. the built-in `weather.home` from
   whatever weather integration you use) for the forecast-based rain skip.
+- Your Rachio controller's device name (Rachio app → Settings → Devices).
+  `tunables.use_pause_collapse` defaults to **on**, which submits the whole
+  night as one Rachio schedule and uses device-level pause/resume/stop —
+  those calls target the controller by name, so `rachio_device_name` in
+  `config.yaml` must match it. Set `use_pause_collapse: false` to keep the
+  previous multi-block scheduling behavior instead, in which case this
+  device name isn't used.
 
 ## Install
 
@@ -47,13 +55,25 @@ readings instead of a fixed clock.
    entities by hand via the Helpers UI.) This creates the drought-level
    select, standby/dew-formed booleans, the stop button, and the
    `statistics`/`template` sensors for observed- and forecast-overnight data
-   that the app reads.
+   that the app reads. It does **not** create
+   `input_boolean.irrigation_run_active` — create that helper yourself
+   (Settings → Devices & Services → Helpers → Toggle). It's the marker the
+   app sets while a collapsed run is in flight so startup recovery can detect
+   and self-heal an interrupted (even paused) run; required whenever
+   `tunables.use_pause_collapse` is on (the default).
 4. Copy `examples/config.example.yaml` to
    `<config>/pyscript/apps/irrigation/config.yaml` and edit it:
    - The `homeassistant:` section — point every entity/service binding at
-     your own Home Assistant entities.
+     your own Home Assistant entities, including `rachio_device_name` (your
+     controller's device name) and `run_active_boolean` (the helper created
+     in step 3, if you kept the default entity id).
    - The `zones:` section — one entry per Rachio zone you want the
      scheduler to manage, with your own zone IDs and sensor bindings.
+   - The `drought_profiles:` section (optional to tune) — each level sets when
+     its watering window ends via `end_anchor` (`dawn` or `sunrise`) and an
+     optional `end_offset_minutes` (positive = minutes before the anchor,
+     negative = after); omit the key to inherit the global
+     `tunables.end_offset_minutes`. See the comments in `config.example.yaml`.
 5. Add your Rachio API key to `secrets.yaml`, under the key name given by
    `rachio_api_key_secret` in `config.yaml` (defaults to `rachio_api_key`).
 6. **Restart Home Assistant.** A full restart is required the first time:

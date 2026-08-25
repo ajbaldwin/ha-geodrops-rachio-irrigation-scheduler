@@ -59,6 +59,13 @@ tunables:
   # fraction of a full refill, at or above this confidence.
   rain_skip_probability_pct: 70
   rain_skip_refill_fraction: 0.5
+  # Notification-collapse: submit the whole night as ONE Rachio schedule and
+  # fill idle soak gaps with device pauses (one schedule-start notification).
+  use_pause_collapse: true
+  # HA rachio.pause_watering ceiling (minutes); chain beyond for longer gaps.
+  max_pause_minutes: 60
+  # 0 = unbounded (one schedule); >0 = fallback split strategy.
+  max_pauses_per_schedule: 0
 
 # ------------------------------------------------------------------------------
 # drought_profiles: keys MUST match your input_select.irrigation_drought_level
@@ -73,6 +80,11 @@ tunables:
 # end_anchor: which sun event the window ends before. Levels 0-2 finish at
 # sunrise, so watering ends just as drying begins; Level 3 finishes at dawn,
 # before any sun, to minimise evaporative loss when water is scarce.
+# end_offset_minutes (optional, per level): shift the window END relative to
+# end_anchor. POSITIVE = BEFORE the anchor, NEGATIVE = AFTER, 0 = at the anchor.
+#   sunrise-15  ->  end_anchor: sunrise, end_offset_minutes: 15
+#   dawn+15     ->  end_anchor: dawn,    end_offset_minutes: -15
+# Omit the key to inherit the global tunables.end_offset_minutes.
 # ------------------------------------------------------------------------------
 drought_profiles:
   "Level 0 - Normal":      {target_offset: 0,  trigger_margin: 0, runtime_scale: 1.0, rain_skip_horizon_hours: 12, end_anchor: sunrise}
@@ -108,6 +120,13 @@ homeassistant:
   standby_switch: switch.sprinkler_standby
   # input_boolean the app sets when dew is detected (blocks disease-risk watering).
   dew_formed_boolean: input_boolean.dew_formed
+  # Rachio controller device NAME (Settings -> Devices) — required when
+  # tunables.use_pause_collapse is enabled; target for pause/resume/stop when
+  # collapsing the night into one schedule.
+  rachio_device_name: "Main House"
+  # Persisted marker helper — set while a collapsed run is in flight so startup
+  # recovery can detect an interrupted (even paused) run.
+  run_active_boolean: input_boolean.irrigation_run_active
 
   # Weather station entities. Defaults below assume a WeatherFlow Tempest;
   # override with your own station's entities if different.

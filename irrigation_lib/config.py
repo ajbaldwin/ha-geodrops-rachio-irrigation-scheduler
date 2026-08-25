@@ -53,6 +53,11 @@ class Tunables:
     # depth rather than a fixed depth, so it means something and self-adjusts.
     rain_skip_probability_pct: float = 70.0
     rain_skip_refill_fraction: float = 0.5
+    # Notification-collapse: submit the whole night as ONE Rachio schedule and
+    # fill idle soak gaps with device pauses (one schedule-start notification).
+    use_pause_collapse: bool = True
+    max_pause_minutes: int = 60  # HA rachio.pause_watering ceiling; chain beyond
+    max_pauses_per_schedule: int = 0  # 0 = unbounded (one schedule); >0 = fallback
 
 
 # Where a run's watering window ENDS, per drought profile. Dawn is the earlier
@@ -73,6 +78,17 @@ def end_anchor_sensor(name) -> str:
     return END_ANCHOR_SENSORS.get(name, END_ANCHOR_SENSORS["dawn"])
 
 
+def resolved_end_offset(profile, global_offset: int) -> int:
+    """The end offset in effect for a profile: its own if set, else the global.
+
+    Tests `is not None`, not truthiness, so a per-level 0 ("finish exactly at the
+    anchor") overrides a nonzero global instead of falling back to it.
+    """
+    if profile.end_offset_minutes is not None:
+        return profile.end_offset_minutes
+    return global_offset
+
+
 @dataclass(frozen=True)
 class DroughtProfile:
     target_offset: int
@@ -87,6 +103,9 @@ class DroughtProfile:
     # so the rain-skip horizon is per profile. Defaulted so existing direct
     # constructions stay valid.
     rain_skip_horizon_hours: int = 18
+    # Per-level override of Tunables.end_offset_minutes. None = inherit the global.
+    # POSITIVE = minutes BEFORE end_anchor, NEGATIVE = after (end = anchor - offset).
+    end_offset_minutes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +163,8 @@ class HABindings:
     standby_boolean: str = "input_boolean.irrigation_standby"
     standby_switch: str = "switch.sprinkler_standby"
     dew_formed_boolean: str = "input_boolean.dew_formed"
+    rachio_device_name: str = "PLACEHOLDER"
+    run_active_boolean: str = "input_boolean.irrigation_run_active"
     weather: WeatherEntities = WeatherEntities()
     sun: SunAnchors = SunAnchors()
     derived: DerivedSensors = DerivedSensors()
@@ -204,6 +225,8 @@ def parse_bindings(raw: dict) -> HABindings:
         standby_boolean=ha.get("standby_boolean", HABindings().standby_boolean),
         standby_switch=ha.get("standby_switch", HABindings().standby_switch),
         dew_formed_boolean=ha.get("dew_formed_boolean", HABindings().dew_formed_boolean),
+        rachio_device_name=ha.get("rachio_device_name", HABindings().rachio_device_name),
+        run_active_boolean=ha.get("run_active_boolean", HABindings().run_active_boolean),
         weather=weather, sun=sun, derived=derived,
     )
 
