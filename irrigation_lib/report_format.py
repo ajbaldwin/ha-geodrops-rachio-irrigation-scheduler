@@ -24,6 +24,10 @@ class RunResult:
     window_start: str = ""
     window_end: str = ""
     window_hours: float = 0.0
+    # How many times the collapsed Rachio schedule was dropped mid-run and
+    # re-issued. 0 on a healthy night; defaulted so existing constructions stay
+    # valid.
+    recoveries: int = 0
 
 
 def display_name(zone_key: str) -> str:
@@ -63,6 +67,9 @@ def format_notification(r: RunResult) -> str:
     if r.uncompleted:
         parts = [f"{display_name(z)} ({reason})" for z, reason in r.uncompleted.items()]
         lines.append(f"Not completed: {', '.join(parts)}")
+    if r.recoveries:
+        plural = "s" if r.recoveries != 1 else ""
+        lines.append(f"Rachio dropped the schedule {r.recoveries} time{plural}.")
     return "\n".join(lines)
 
 

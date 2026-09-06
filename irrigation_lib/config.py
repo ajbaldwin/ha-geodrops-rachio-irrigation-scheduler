@@ -58,6 +58,11 @@ class Tunables:
     use_pause_collapse: bool = True
     max_pause_minutes: int = 60  # HA rachio.pause_watering ceiling; chain beyond
     max_pauses_per_schedule: int = 0  # 0 = unbounded (one schedule); >0 = fallback
+    # Collapsed-schedule drop recovery: when a mid-run never-started follows
+    # delivered water, Rachio dropped the schedule (a ~60-min cumulative-pause
+    # cap, observed 2026-08-27). Re-issue a fresh schedule for the remaining
+    # water up to this many times per run. 0 disables recovery (abort as before).
+    max_schedule_retries: int = 2
 
 
 # Where a run's watering window ENDS, per drought profile. Dawn is the earlier

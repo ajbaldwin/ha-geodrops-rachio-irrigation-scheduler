@@ -254,3 +254,13 @@ def test_parse_config_reads_per_level_end_offset(example_config_path):
     raw["drought_profiles"]["Level 0 - Normal"]["end_offset_minutes"] = -15
     cfg = config.parse_config(raw)
     assert cfg.drought_profiles["Level 0 - Normal"].end_offset_minutes == -15
+
+
+def test_max_schedule_retries_defaults_to_two():
+    from irrigation_lib.config import Tunables
+    assert Tunables().max_schedule_retries == 2
+
+
+def test_max_schedule_retries_is_overridable():
+    from irrigation_lib.config import Tunables
+    assert Tunables(max_schedule_retries=0).max_schedule_retries == 0

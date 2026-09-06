@@ -33,6 +33,7 @@ import irrigation_lib.evaluate as evaluate
 import irrigation_lib.plan as plan
 import irrigation_lib.program as program
 import irrigation_lib.rachio_runtime as rachio_runtime
+import irrigation_lib.recovery as recovery
 import irrigation_lib.report_format as report_format
 import irrigation_lib.sensors as sensors
 import irrigation_lib.weather as weather
@@ -49,6 +50,14 @@ STATE_DIR = "/config/pyscript/apps/irrigation/state"
 # happened" and `irrigation_status` is live, both of which the next run or the
 # startup handler re-establishes correctly.
 PERSISTED = ("irrigation_last_nightly", "irrigation_calibration")
+# A planned nightly that is WAITING for its pre-dawn window holds its whole plan
+# in memory across a task.sleep of several hours. A restart during that sleep
+# loses it silently: nothing has watered, so the startup safety-stop finds no
+# open valve and cannot tell "was waiting" from "nothing/already finished". This
+# marker, written just before the sleep and cleared the instant the wait ends,
+# is the persisted proof that lets startup re-arm the run. Not in PERSISTED: it
+# is a live control file, not a historical record to re-publish.
+WAITING_MARKER_PATH = STATE_DIR + "/irrigation_waiting.json"
 LOGBOOK_NAME = "Irrigation"
 # Every Logbook entry is attached to an entity so the activity log can be
 # FILTERED instead of scrolled. Run-level events land here; per-zone events land
@@ -91,6 +100,14 @@ BLOCK_END_GRACE_S = 90
 # Without a bound, "not yet on" and "never came on" are indistinguishable and
 # the second is scored as a full success.
 BLOCK_START_CONFIRM_S = 90
+# Post-resume probe window: how long to wait for a valve to come back on after
+# a device resume before calling it a drop. Polled immediately, so a healthy
+# resume returns at once; only a dropped schedule waits the full window.
+# Matches BLOCK_START_CONFIRM_S so the probe can only ever accelerate a
+# verdict the 90s never-started guard would also reach — never a shorter-
+# window false positive on a healthy-but-slow resume. 90 is also a multiple
+# of CHECK_INTERVAL_S (30), so the wait bound is exact.
+RESUME_PROBE_S = 90
 RACHIO_BASE = "https://api.rach.io/1/public/"
 RUNTIME_CACHE_TTL_S = 6 * 3600
 
@@ -338,6 +355,19 @@ def _read_json(path):
 
 
 @pyscript_compile
+def _delete_file(path):
+    """Remove a file, tolerating its absence. Clearing the waiting marker must be
+    idempotent: it is cleared once the pre-dawn wait ends AND once startup has
+    consumed it, and either may run when the file is already gone."""
+    import os
+
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+@pyscript_compile
 def _read_config_yaml(path):
     import yaml
 
@@ -552,6 +582,20 @@ def run_plan(slots, zone_switches, is_standby, is_manual_stop, is_rain,
         raise
 
 
+def _crumb(crumbs, event, detail=None):
+    """Append one timestamped execution breadcrumb.
+
+    Persisted into the run record so a schedule drop is diagnosable from the
+    record alone — the Rachio integration's own log was missing the morning the
+    2026-08-27 drop had to be reconstructed from valve history.
+    """
+    entry = {"t": dt.datetime.now().astimezone().strftime("%H:%M:%S"),
+             "event": event}
+    if detail is not None:
+        entry["detail"] = detail
+    crumbs.append(entry)
+
+
 def run_collapsed(slots, zone_switches, is_standby, is_manual_stop, is_rain,
                   is_rain_at_start):
     """Execute a plan as ONE (or few) Rachio schedule(s) with device pauses.
@@ -571,12 +615,16 @@ def run_collapsed(slots, zone_switches, is_standby, is_manual_stop, is_rain,
     steps = program.plan_program(slots)
     if not steps:
         return {"watered": [], "aborted_reason": None,
-                "delivered_minutes": {}, "blocks": []}
+                "delivered_minutes": {}, "blocks": [], "recoveries": 0,
+                "breadcrumbs": []}
     segments = program.segment_program(steps, tun.max_pauses_per_schedule)
 
     watered = []
     delivered = {}
     sent = []
+    crumbs = []
+    retries_used = 0
+    recoveries = 0
     all_switches = list(zone_switches.values())
     switch_by_zone = zone_switches
 
@@ -588,47 +636,81 @@ def run_collapsed(slots, zone_switches, is_standby, is_manual_stop, is_rain,
                 stop_device()
                 stop_all(all_switches)
                 return {"watered": watered, "aborted_reason": reason,
-                        "delivered_minutes": delivered, "blocks": sent}
+                        "delivered_minutes": delivered, "blocks": sent,
+                        "recoveries": recoveries, "breadcrumbs": crumbs}
             if is_rain_at_start():
                 stop_device()
                 stop_all(all_switches)
                 return {"watered": watered, "aborted_reason": "rain-at-start",
-                        "delivered_minutes": delivered, "blocks": sent}
+                        "delivered_minutes": delivered, "blocks": sent,
+                        "recoveries": recoveries, "breadcrumbs": crumbs}
 
-            runs = program.program_runs(seg.steps)
-            # Poll-verify nothing is already running before we hand over a
-            # schedule (start_multiple_zone_schedule does not stop current water).
-            for switch in all_switches:
-                if poll_zone_running(switch):
-                    log.warning(f"irrigation: {switch} was already running before "
-                                "a collapsed segment; stopping it first")
-                    stop_zone(switch)
+            steps = seg.steps
+            is_recovery = False
+            while True:
+                runs = program.program_runs(steps)
+                # Poll-verify nothing is already running before we hand over a
+                # schedule (start_multiple_zone_schedule does not stop current water).
+                for switch in all_switches:
+                    if poll_zone_running(switch):
+                        log.warning(f"irrigation: {switch} was already running before "
+                                    "a collapsed segment; stopping it first")
+                        stop_zone(switch)
 
-            api_calls += 1
-            service.call(
-                "rachio", "start_multiple_zone_schedule",
-                entity_id=blocks.entity_ids(runs, switch_by_zone),
-                duration=blocks.duration_csv(runs),
-            )
-            sent.append({
-                "minutes": sum([r.minutes for r in runs]),
-                "runs": [[r.zone_key, r.minutes] for r in runs],
-            })
+                api_calls += 1
+                service.call(
+                    "rachio", "start_multiple_zone_schedule",
+                    entity_id=blocks.entity_ids(runs, switch_by_zone),
+                    duration=blocks.duration_csv(runs),
+                )
+                sent.append({
+                    "minutes": sum([r.minutes for r in runs]),
+                    "runs": [[r.zone_key, r.minutes] for r in runs],
+                })
+                _crumb(crumbs, "recover" if is_recovery else "start",
+                       detail=[[r.zone_key, r.minutes] for r in runs])
 
-            aborted, watering_seconds = _walk_segment(
-                seg, all_switches, is_standby, is_manual_stop, is_rain)
+                aborted, watering_seconds, stopped_index = _walk_segment(
+                    steps, all_switches, is_standby, is_manual_stop, is_rain,
+                    crumbs)
 
-            gave = blocks.delivered(runs, watering_seconds)
-            for zone_key, minutes in gave.items():
-                delivered[zone_key] = delivered.get(zone_key, 0) + minutes
-                if zone_key not in watered:
-                    watered.append(zone_key)
+                # Credit by measurement; track what THIS schedule delivered so the
+                # recovery verdict can tell a dropped-mid-run schedule from one
+                # Rachio never started.
+                gave = blocks.delivered(runs, watering_seconds)
+                delivered_since_issue = 0
+                for zone_key, minutes in gave.items():
+                    delivered[zone_key] = delivered.get(zone_key, 0) + minutes
+                    delivered_since_issue += minutes
+                    if zone_key not in watered:
+                        watered.append(zone_key)
 
-            if aborted:
-                stop_device()
-                stop_all(all_switches)
-                return {"watered": watered, "aborted_reason": aborted,
-                        "delivered_minutes": delivered, "blocks": sent}
+                if aborted:
+                    if aborted == "never-started":
+                        _crumb(crumbs, "drop-detected",
+                               detail=int(delivered_since_issue))
+                    decision = recovery.verdict(
+                        aborted, delivered_since_issue, is_recovery,
+                        retries_used, tun.max_schedule_retries)
+                    if decision == recovery.RECOVER:
+                        log.warning(
+                            f"irrigation: Rachio dropped the schedule after "
+                            f"{int(delivered_since_issue)} min; re-issuing for the "
+                            f"remaining water (recovery {retries_used + 1})")
+                        retries_used += 1
+                        recoveries += 1
+                        stop_device()
+                        steps = recovery.remaining_after(steps, stopped_index)
+                        is_recovery = True
+                        continue
+                    # give-up or continue-abort: end the run.
+                    _crumb(crumbs, "give-up", detail=aborted)
+                    stop_device()
+                    stop_all(all_switches)
+                    return {"watered": watered, "aborted_reason": aborted,
+                            "delivered_minutes": delivered, "blocks": sent,
+                            "recoveries": recoveries, "breadcrumbs": crumbs}
+                break  # segment completed cleanly
 
             _await_block_end(all_switches)
 
@@ -639,10 +721,13 @@ def run_collapsed(slots, zone_switches, is_standby, is_manual_stop, is_rain,
                     stop_device()
                     stop_all(all_switches)
                     return {"watered": watered, "aborted_reason": idle_aborted,
-                            "delivered_minutes": delivered, "blocks": sent}
+                            "delivered_minutes": delivered, "blocks": sent,
+                            "recoveries": recoveries, "breadcrumbs": crumbs}
 
+        _crumb(crumbs, "end")
         return {"watered": watered, "aborted_reason": None,
-                "delivered_minutes": delivered, "blocks": sent}
+                "delivered_minutes": delivered, "blocks": sent,
+                "recoveries": recoveries, "breadcrumbs": crumbs}
     except Exception:
         stop_device()
         stop_all(all_switches)
@@ -651,48 +736,74 @@ def run_collapsed(slots, zone_switches, is_standby, is_manual_stop, is_rain,
         set_run_active(False)
 
 
-def _walk_segment(seg, all_switches, is_standby, is_manual_stop, is_rain):
-    """Drive one segment's steps; return (aborted_reason, watering_seconds).
+def _resume_took_hold(all_switches):
+    """After a resume, did a valve actually come back on within the probe window?
 
-    watering_seconds counts only time under water steps (pauses excluded), so
-    blocks.delivered credits zones correctly across the pauses. Pause timing
-    lands on our own clock, not the actual zone transition; _sleep_watching only
-    watches for aborts during that wait, it does not align the pause to the real
-    boundary. The resulting few-seconds-early start on the next zone is an
-    accepted residual (spec §3.4). A pause step issues pause_device, sleeps the
-    gap (chaining beyond the 60-min ceiling), then resume_device.
+    A dropped schedule resumes to nothing (a ~2 s valve blip was all 2026-08-27
+    showed). Detecting that here front-runs the 90 s never-started guard and
+    shortens the dead time before a re-issue; the guard in _sleep_watching stays
+    as the backstop for a drop this short window misses.
+    """
+    waited = 0
+    while True:
+        if any_zone_running(all_switches):
+            return True
+        if waited >= RESUME_PROBE_S:
+            return False
+        task.sleep(CHECK_INTERVAL_S)
+        waited += CHECK_INTERVAL_S
+
+
+def _walk_segment(steps, all_switches, is_standby, is_manual_stop, is_rain, crumbs):
+    """Drive one schedule's steps; return (aborted, watering_seconds, stopped_index).
+
+    watering_seconds counts only time under water steps (pauses excluded).
+    stopped_index is the index into `steps` of the step the walk aborted on
+    (len(steps) if it completed). After a resume, a post-resume probe checks the
+    valve actually came back and reports a drop early (see _resume_took_hold);
+    the _sleep_watching never-started guard is the backstop. Pause timing lands
+    on our own clock (spec §3.4 residual).
     """
     watering_seconds = 0
-    for step in seg.steps:
+    just_resumed = False
+    for i, step in enumerate(steps):
         if step.kind == "water":
+            if just_resumed and not _resume_took_hold(all_switches):
+                return "never-started", watering_seconds, i
+            just_resumed = False
             aborted, elapsed = _sleep_watching(
                 step.minutes * 60, is_standby, is_manual_stop, is_rain,
                 watch_switches=all_switches,
             )
             watering_seconds += elapsed
             if aborted:
-                return aborted, watering_seconds
+                return aborted, watering_seconds, i
         else:  # pause: keep the schedule alive across an idle soak gap
             remaining = step.minutes
             aborted = None
             while remaining > 0:
-                # Clamp to [1, 60]: 60 is HA rachio.pause_watering's ceiling (pause_device
-                # clamps the same), so our sleep stays in lockstep with the device's auto-resume;
-                # max(1, ...) prevents a non-positive misconfig from stalling the loop.
+                # Clamp to [1, 60]: 60 is HA rachio.pause_watering's ceiling
+                # (pause_device clamps the same), so our sleep stays in lockstep
+                # with the device's auto-resume; max(1, ...) prevents a
+                # non-positive misconfig from stalling the loop.
                 span = max(1, min(60, _current_cfg.tunables.max_pause_minutes, remaining))
                 pause_device(span)
+                _crumb(crumbs, "pause", detail=span)
                 aborted, _p = _sleep_watching(
                     span * 60, is_standby, is_manual_stop, is_rain,
                     watch_switches=all_switches, paused=True,
                 )
                 remaining -= span
                 if aborted:
-                    return aborted, watering_seconds
+                    return aborted, watering_seconds, i
                 if remaining > 0:
                     # chained pause: it auto-resumed; re-pause immediately.
                     resume_device()
+                    _crumb(crumbs, "resume")
             resume_device()
-    return None, watering_seconds
+            _crumb(crumbs, "resume")
+            just_resumed = True
+    return None, watering_seconds, len(steps)
 
 
 def _await_block_end(zone_switches):
@@ -1185,6 +1296,38 @@ def _restore_records():
                   new_attributes=data["attributes"])
 
 
+def _write_waiting_marker(window_end_iso, stamp, trigger):
+    """Persist that a run is WAITING for its pre-dawn window (see
+    WAITING_MARKER_PATH). Written just before the wait sleep. A failure to
+    persist must not take down the run — the wait still happens in memory; only
+    restart recovery is forfeited, which is exactly today's behavior."""
+    try:
+        task.executor(
+            _write_json_atomic, WAITING_MARKER_PATH,
+            {"window_end": window_end_iso, "stamp": stamp, "trigger": trigger},
+        )
+    except Exception as err:
+        log.warning(f"irrigation: could not persist waiting marker ({err})")
+
+
+def _clear_waiting_marker():
+    """Remove the waiting marker. Idempotent (see _delete_file); called both when
+    the wait ends and after startup consumes it."""
+    try:
+        task.executor(_delete_file, WAITING_MARKER_PATH)
+    except Exception as err:
+        log.warning(f"irrigation: could not clear waiting marker ({err})")
+
+
+def _read_waiting_marker():
+    """The parsed waiting marker, or None when absent/unreadable."""
+    try:
+        return task.executor(_read_json, WAITING_MARKER_PATH)
+    except Exception as err:
+        log.warning(f"irrigation: could not read waiting marker ({err})")
+        return None
+
+
 def _publish_last_run(stamp, trigger, ctx=None, result=None, outcome=None,
                       skipped=None):
     """Full, untruncated record of what the nightly run actually did.
@@ -1240,6 +1383,8 @@ def _publish_last_run(stamp, trigger, ctx=None, result=None, outcome=None,
             "aborted_reason": outcome["aborted_reason"],
             "block_count": len(outcome.get("blocks", [])),
             "blocks": outcome.get("blocks", []),
+            "recoveries": outcome.get("recoveries", 0),
+            "breadcrumbs": outcome.get("breadcrumbs", []),
         })
     attributes["rachio_calls"] = api_calls
     attributes["state_polls"] = state_polls
@@ -1383,7 +1528,15 @@ def _plan_and_run(wait, trigger):
                     f"Plan ready — {len(the_plan.watered)} zone(s), "
                     f"{int(the_plan.span_minutes)} min span, starting {start_str}"
                 )
+                # Persist the wait so a restart during this multi-hour sleep can
+                # re-arm the run instead of losing the night silently. window_end
+                # is when the watering window closes (dawn − end_offset); startup
+                # re-arms only while now is still before it.
+                _write_waiting_marker(ctx["end"].isoformat(), stamp, trigger)
                 task.sleep(wait_s)
+                # The wait is over (whichever branch follows). Clear the marker so
+                # a later restart cannot re-arm a run that already left waiting.
+                _clear_waiting_marker()
 
             # The plan was built at 23:00 but watering starts hours later, and the
             # forecast refreshes every 15 minutes. Without this, a forecast that
@@ -1453,6 +1606,7 @@ def _plan_and_run(wait, trigger):
             window_start=ctx["earliest_start"].astimezone().strftime("%H:%M"),
             window_end=end_anchor.astimezone().strftime("%H:%M"),
             window_hours=round(ctx["cap_minutes"] / 60.0, 2),
+            recoveries=outcome.get("recoveries", 0),
         )
         # Record what happened BEFORE announcing it. The recap talks to notify and
         # calendar — external services whose failure modes this app does not own —
@@ -1878,10 +2032,39 @@ def _on_startup():
         return
 
     if not running:
-        # No marker and nothing open: no run was in flight, or one had already
-        # finished — we cannot tell the two apart without persisted state, so we
-        # deliberately do NOT self-heal here (see the docstring's note on
-        # double-watering).
+        # No collapsed-run marker and nothing open. Before giving up, check the
+        # waiting marker: a nightly that was still WAITING for its pre-dawn window
+        # had opened no valve, so it is invisible to every check above and would
+        # otherwise be lost silently (the 2026-08-30 02:28 OOM did exactly this).
+        # The marker IS the persisted state that makes re-arming safe here — a
+        # waiting run delivered zero, so re-planning from live moisture cannot
+        # double-water. Consume it (read then always clear) and act on the
+        # verdict.
+        marker = _read_waiting_marker()
+        _clear_waiting_marker()
+        action = recovery.startup_action(marker, dt.datetime.now().isoformat())
+        if action == recovery.RE_ARM:
+            _activity(
+                "Startup: a nightly run was waiting for its pre-dawn window when "
+                "HA restarted; re-planning from live moisture"
+            )
+            task.unique("irrigation_run")
+            _plan_and_run(wait=True, trigger="startup-heal")
+        elif action == recovery.MISSED:
+            # Came back after the window closed: nothing to water. Record the
+            # night as missed so the morning-after query is answerable.
+            stamp = marker.get("stamp") or dt.datetime.now().isoformat(
+                timespec="seconds")
+            trigger = marker.get("trigger") or "nightly"
+            _publish_last_run(stamp, trigger, skipped="missed-restart")
+            _set_status("skipped", detail="missed — restart after window closed")
+            _activity(
+                "Startup: a nightly run was waiting when HA restarted, but the "
+                "watering window had already closed; recorded as missed"
+            )
+        # IGNORE: no run was waiting (or the marker was malformed). Either no run
+        # was in flight or one had already finished — indistinguishable without
+        # state, so we do NOT self-heal (see the docstring's double-watering note).
         return
 
     stop_all(running)
@@ -1920,6 +2103,34 @@ def irrigation_stop():
     global _manual_stop
     _manual_stop = True
     _activity("Manual stop requested")
+
+
+@service
+def irrigation_reset():
+    """Cancel a planned or in-progress run and reset the system to idle.
+
+    irrigation_stop only raises the manual-stop flag, which the in-run watch
+    honours once watering is underway; it does NOT interrupt the multi-hour
+    pre-dawn "waiting" sleep, so a planned-but-unstarted run keeps its slot until
+    its start time. This kills the waiting or watering task outright, closes any
+    open valves, clears the waiting + run-active markers, and returns status to
+    idle. Safe to call in any state.
+    """
+    global _manual_stop
+    task.unique("irrigation_run")  # terminate the waiting or watering run task now
+    _manual_stop = False
+    stop_device()  # stop any running/paused Rachio schedule (self-guarding)
+    try:
+        stop_all([z.rachio_switch for z in _current_cfg.zones.values()])
+    except Exception:
+        pass  # no config loaded / nothing open at the zone level
+    try:
+        _clear_waiting_marker()
+        set_run_active(False)
+    except Exception as err:
+        log.warning(f"irrigation: reset — marker cleanup skipped: {err}")
+    _set_status("idle", detail="reset")
+    _activity("Manual reset — planned/running run cancelled; system idle")
 
 
 @service

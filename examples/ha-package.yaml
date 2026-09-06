@@ -95,6 +95,11 @@ script:
     icon: mdi:stop-circle-outline
     sequence:
       - action: pyscript.irrigation_stop
+  irrigation_reset:
+    alias: "Irrigation: Reset"
+    icon: mdi:cancel
+    sequence:
+      - action: pyscript.irrigation_reset
   irrigation_refresh_runtimes:
     alias: "Irrigation: Refresh Runtimes"
     icon: mdi:refresh

@@ -143,6 +143,27 @@ def test_calendar_standby_note():
     assert title == "Irrigation Standby"
 
 
+def _rr(**kw):
+    from irrigation_lib.report_format import RunResult
+    base = dict(watered=["zone_a"], uncompleted={}, start="04:01",
+                end="05:38", per_zone_minutes={"zone_a": 56}, standby=False)
+    base.update(kw)
+    return RunResult(**base)
+
+
+def test_no_recovery_line_when_zero():
+    from irrigation_lib import report_format
+    assert "Rachio" not in report_format.format_notification(_rr(recoveries=0))
+
+
+def test_recovery_line_appears_when_recovered():
+    from irrigation_lib import report_format
+    msg = report_format.format_notification(_rr(recoveries=2))
+    # Neutral wording: true whether the run fully recovered or gave up after N
+    # drops (the "Not completed" line carries the shortfall in the give-up case).
+    assert "Rachio dropped the schedule 2 times" in msg
+
+
 # ─── calendar_span ───────────────────────────────────────────────────────────
 # HA's calendar.create_event rejects a pair of datetimes in DIFFERENT timezones
 # ("Expected all values to have the same timezone"). The run's start is derived
