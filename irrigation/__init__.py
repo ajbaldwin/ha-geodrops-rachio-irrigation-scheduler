@@ -27,7 +27,9 @@ import time
 # irrigation_lib.X as X` loads the leaf module file directly.
 import irrigation_lib.abort as abort
 import irrigation_lib.blocks as blocks
+import irrigation_lib.calibration as calibration
 import irrigation_lib.config as config
+import irrigation_lib.dosing as dosing
 import irrigation_lib.drought as drought
 import irrigation_lib.evaluate as evaluate
 import irrigation_lib.plan as plan
@@ -114,7 +116,7 @@ RUNTIME_CACHE_TTL_S = 6 * 3600
 _manual_stop = False
 api_calls = 0    # Rachio-affecting service calls (start/stop) — the real budget
 state_polls = 0  # local HA state reads (free); tracked separately, see below
-_runtime_cache = {"ts": 0.0, "runtimes": {}, "depths": {}}
+_runtime_cache = {"ts": 0.0, "runtimes": {}, "depths": {}, "spans": {}}
 _current_tun = None  # tunables of the in-flight run; read by _is_rain()
 # Sibling globals to _current_tun, set at the same points (and at every other
 # site that reads an entity/service outside an active run — preview,
@@ -386,10 +388,11 @@ def _http_get_json(url, key):
 
 
 def _fetch_zone_data():
-    """(runtimes_minutes, refill_depths_mm) from one pass over the device payload.
+    """(runtimes_minutes, refill_depths_mm, refill_spans_pts) from one pass over
+    the device payload.
 
-    Both come from the same `device/{id}` response, so capturing depths costs no
-    additional API calls.
+    All come from the same `device/{id}` response, so capturing depths and spans
+    costs no additional API calls.
     """
     # _current_bindings may be unset only if this is called before any config
     # load at all (should not happen — every entry point that can reach here
@@ -404,13 +407,14 @@ def _fetch_zone_data():
         log.warning(
             "irrigation: no rachio_api_key in secrets.yaml; using static values"
         )
-        return {}, {}
+        return {}, {}, {}
     person = task.executor(_http_get_json, RACHIO_BASE + "person/info", key)
     devices = task.executor(
         _http_get_json, RACHIO_BASE + "person/" + person["id"], key
     )["devices"]
     runtimes = {}
     depths = {}
+    spans = {}
     for device in devices:
         payload = task.executor(
             _http_get_json, RACHIO_BASE + "device/" + device["id"], key
@@ -418,7 +422,8 @@ def _fetch_zone_data():
         zones = payload.get("zones", [])
         runtimes.update(rachio_runtime.parse_runtimes(zones))
         depths.update(rachio_runtime.parse_refill_depths(zones))
-    return runtimes, depths
+        spans.update(rachio_runtime.parse_refill_spans(zones))
+    return runtimes, depths, spans
 
 
 def _refresh_zone_cache(force=False):
@@ -431,7 +436,7 @@ def _refresh_zone_cache(force=False):
     ):
         return True
     try:
-        runtimes, depths = _fetch_zone_data()
+        runtimes, depths, spans = _fetch_zone_data()
     except Exception as err:
         log.warning(
             f"irrigation: Rachio fetch failed ({err}); using static values"
@@ -441,6 +446,7 @@ def _refresh_zone_cache(force=False):
         _runtime_cache["ts"] = now
         _runtime_cache["runtimes"] = runtimes
         _runtime_cache["depths"] = depths
+        _runtime_cache["spans"] = spans
         return True
     return False
 
@@ -457,6 +463,51 @@ def get_refill_depths(force=False):
     if _refresh_zone_cache(force):
         return _runtime_cache["depths"]
     return {}
+
+
+def get_refill_spans(force=False):
+    """{rachio_zone_id: refill_span_pts}; {} on failure (caller falls back)."""
+    if _refresh_zone_cache(force):
+        return _runtime_cache["spans"]
+    return {}
+
+
+EFFICACY_PATH = STATE_DIR + "/irrigation_efficacy.json"
+
+
+def _read_efficacy_store():
+    """{zone_key: {"efficacy","span_pts","state",...}} or {} when the file is absent."""
+    data = task.executor(_read_json, EFFICACY_PATH)
+    return data if isinstance(data, dict) else {}
+
+
+def _write_efficacy_store(store):
+    task.executor(_write_json_atomic, EFFICACY_PATH, store)
+
+
+def _rained_since_run(bindings, tun):
+    """Rain-confounder flag for the settle pass: did meaningful rain fall over the
+    overnight run->settle window? Uses the daily rain-accumulation gauge (resets at
+    midnight), read at the mid-morning settle pass — the runs are all post-midnight,
+    so today's accumulation covers the run and its settling. Missing/non-numeric
+    reads fail safe to False (don't discard the observation on a gauge glitch)."""
+    try:
+        val = float(state.get(bindings.weather.rain_today))
+    except (TypeError, ValueError):
+        return False
+    return val > tun.rain_confounder_mm
+
+
+PENDING_OBS_PATH = STATE_DIR + "/irrigation_pending_obs.json"
+
+
+def _append_pending_obs(records):
+    """Append calibration observation stubs to the pending queue (restart-safe)."""
+    existing = task.executor(_read_json, PENDING_OBS_PATH)
+    if not isinstance(existing, list):
+        existing = []
+    existing.extend(records)
+    task.executor(_write_json_atomic, PENDING_OBS_PATH, existing)
 
 
 # ─── Plan execution (poll-verify + abort watching) ───────────────────────────
@@ -880,6 +931,29 @@ def _sleep_watching(seconds, is_standby, is_manual_stop, is_rain, watch_switches
 
 # ─── Orchestration ───────────────────────────────────────────────────────────
 
+def _zone_excluded(zone):
+    """True only when the zone's exclude_boolean is explicitly "on".
+
+    Empty binding, or a missing/unavailable/renamed entity, fails safe to
+    NOT excluded (normal watering) — same NameError-tolerant pattern as
+    _is_standby. A zone is excluded (from both the nightly plan and probing)
+    only when its mapped helper reads "on".
+
+    Edge: a momentary "unavailable" at plan time (e.g. an HA restart racing the
+    23:00 plan) reads as not-excluded for that one cycle, looking like a
+    return-from-exclusion. Benign — a long exclusion then recalibrates (the
+    desired end state anyway) and a short one stays under the threshold and keeps
+    its calibration.
+    """
+    ent = zone.exclude_boolean
+    if not ent:
+        return False
+    try:
+        return state.get(ent) == "on"
+    except NameError:
+        return False
+
+
 def _is_standby():
     # Either standby source disables the system: the Rachio-native switch OR the
     # input_boolean.irrigation_standby helper (the user-facing disable toggle).
@@ -1158,15 +1232,42 @@ def _plan_context(cfg):
         level = "Level 3 - Critical"
     rng = random.Random()
 
-    evals, targets, uncompleted = [], {}, {}
+    # Loaded before the zone loop so exclusion handling can stamp/reset it; the
+    # dose loop and probe injection below reuse this same (possibly updated) store.
+    efficacy_store = _read_efficacy_store()
+    store_dirty = False
+    now = dt.datetime.now().astimezone()
+    evals, targets, uncompleted, dominant_by_zone = [], {}, {}, {}
     for key, zone in cfg.zones.items():
+        rec = efficacy_store.get(key)
+        if _zone_excluded(zone):
+            # Excluded (e.g. an overseeded zone watered separately): skip the
+            # nightly plan AND probing. Stamp the first excluded plan so a later
+            # return can time-gate whether to recalibrate.
+            if rec is None:
+                rec = {}
+            if "excluded_since" not in rec:
+                rec["excluded_since"] = now.isoformat()
+                efficacy_store[key] = rec
+                store_dirty = True
+            uncompleted[key] = "excluded"
+            continue
+        if rec is not None and rec.get("excluded_since") is not None:
+            # Returned from exclusion: reset to recalibrating if it was out long
+            # enough (soil likely changed, e.g. overseed), else just clear the stamp.
+            efficacy_store[key] = calibration.exclusion_return(
+                rec, now, tun.recalibrate_after_exclusion_hours)
+            store_dirty = True
         reading = sensors.read_zone(zone, _read_zone_signals(zone))
         if not reading.online:
             uncompleted[key] = reading.offline_reason
             continue
         tgt = drought.effective_target(zone, cfg.bands, profile)
         targets[key] = tgt
+        dominant_by_zone[key] = reading.dominant
         evals.append(evaluate.evaluate_zone(reading, tgt))
+    if store_dirty:
+        _write_efficacy_store(efficacy_store)
 
     priority = [e.key for e in evaluate.sort_by_priority(evals, rng)]
 
@@ -1177,8 +1278,28 @@ def _plan_context(cfg):
     # fallback is otherwise SILENT, so a mid-season Rachio outage would quietly
     # plan on stale values with nothing to show for it.
     api_runtimes = get_runtimes()
+    api_spans = get_refill_spans()
+    api_depths_for_dose = get_refill_depths()
+    # True active probing: online, untriggered, calibrating/recalibrating zones
+    # with headroom get a probe run appended at the TAIL of priority (lowest
+    # priority — build_plan drops these first under a tight window, so they never
+    # crowd out a triggered zone). `targets` holds every online zone; those in
+    # `priority` are already triggered. Self-limiting: a zone stops being a
+    # candidate once should_probe returns False (converged, or dominant >= ceiling).
+    if tun.self_calibration_enabled:
+        triggered = set(priority)
+        for key in targets:
+            if key in triggered:
+                continue
+            rec = efficacy_store.get(key) or {}
+            pinned = cfg.zones[key].refill_span_pts > 0
+            if calibration.should_probe(rec.get("state", "calibrating"),
+                                        dominant_by_zone[key], pinned, tun):
+                priority.append(key)
     minutes = {}
     runtime_sources = {}
+    doses = {}
+    dosing_sources = {}
     for k in priority:
         zone_cfg = cfg.zones[k]
         live = api_runtimes.get(zone_cfg.rachio_zone_id)
@@ -1188,7 +1309,78 @@ def _plan_context(cfg):
         else:
             base = zone_cfg.runtime_minutes
             runtime_sources[k] = "static"
-        minutes[k] = plan.cycles_minutes(base, targets[k].runtime_scale)
+        # Resolve span: config pin -> learned -> live Rachio -> None (fallback).
+        # A set refill_span_pts PINS the zone (wins over learning). A learned span
+        # is used unless the zone is recalibrating (post-swap, efficacy invalid).
+        live_span = api_spans.get(zone_cfg.rachio_zone_id)
+        eff = efficacy_store.get(k)
+        if zone_cfg.refill_span_pts > 0:
+            span_pts = zone_cfg.refill_span_pts
+            span_source = "config"
+        elif eff and eff.get("span_pts", 0) > 0 and eff.get("state") != "recalibrating":
+            span_pts = eff["span_pts"]
+            span_source = "learned"
+        elif live_span:
+            span_pts = live_span
+            span_source = "live"
+        else:
+            span_pts = None
+            span_source = "live"  # ignored by dose_zone when span is unusable
+        target = (
+            zone_cfg.refill_target_pct if zone_cfg.refill_target_pct is not None
+            else tun.field_capacity_pct
+        )
+        # A triggered zone has dominant < floor; refilling only UP TO a target
+        # below that floor would compute deficit <= 0 and dose 0 minutes while
+        # still being reported as watered. Clamp the target up to the floor so a
+        # triggered zone always has positive deficit (no-op whenever target >=
+        # floor, which the default field_capacity_pct=87 always is here).
+        target = max(target, targets[k].floor)
+        depth_mm = (
+            api_depths_for_dose.get(zone_cfg.rachio_zone_id)
+            or zone_cfg.refill_depth_mm
+        )
+        dose = dosing.dose_zone(
+            dominant_now=dominant_by_zone[k],
+            refill_target=target,
+            span_pts=span_pts,
+            span_source=span_source,
+            full_refill_min=plan.cycles_minutes(base, 1.0),
+            refill_depth_mm=float(depth_mm),
+            runtime_scale=targets[k].runtime_scale,
+        )
+        minutes[k] = dose.minutes
+        doses[k] = dose
+        dosing_sources[k] = dose.source
+        # Active probe: while calibrating/recalibrating with headroom (and not
+        # pinned), override the computed dose with a small growing probe so the
+        # zone converges in days. cap_for_saturation prevents an overshoot into
+        # the clipped region, and the probe is bounded to one full refill (min
+        # above).
+        pinned = zone_cfg.refill_span_pts > 0
+        rec = eff or {}
+        if tun.self_calibration_enabled and calibration.should_probe(
+                rec.get("state", "calibrating"), dominant_by_zone[k], pinned, tun):
+            full_refill_min = plan.cycles_minutes(base, 1.0)
+            pm = calibration.probe_minutes(
+                full_refill_min, rec.get("prior_minutes"), rec.get("last_rise"), tun)
+            pm = calibration.cap_for_saturation(
+                pm, dominant_by_zone[k], rec.get("efficacy"), tun)
+            pm = min(pm, full_refill_min)
+            minutes[k] = pm
+            dosing_sources[k] = "probe"
+            # Reflect the probe in doses[k] so telemetry and _rain_skip_check see
+            # the probe's actual (small) delivered depth, not the deficit-based
+            # dose that dose_zone computed and we just overrode.
+            probe_frac = min(pm / full_refill_min, 1.0) if full_refill_min > 0 else 0.0
+            doses[k] = dosing.DoseResult(
+                minutes=pm,
+                frac=probe_frac,
+                effective_depth_mm=probe_frac * float(depth_mm),
+                deficit_pts=target - dominant_by_zone[k],
+                span_pts=span_pts or 0.0,
+                source="probe",
+            )
     geo = {k: cfg.zones[k].geography for k in priority}
     adjacency = {k: cfg.zones[k].adjacency for k in priority}
 
@@ -1238,7 +1430,9 @@ def _plan_context(cfg):
         "horizon_hours": profile.rain_skip_horizon_hours,
         "end_anchor": profile.end_anchor,
         "end_offset_minutes": end_offset,
-        "refill_depths": get_refill_depths(),
+        "doses": doses,
+        "dosing_sources": dosing_sources,
+        "dominant_by_zone": dominant_by_zone,
     }
 
 
@@ -1368,6 +1562,32 @@ def _publish_last_run(stamp, trigger, ctx=None, result=None, outcome=None,
             "runtime_sources": ctx["runtime_sources"],
             "horizon_hours": ctx["horizon_hours"],
         })
+        doses = ctx["doses"]
+        attributes["dosing_sources"] = ctx["dosing_sources"]
+        dosing_detail = {}
+        for k in the_plan.watered:
+            d = doses[k]
+            dosing_detail[k] = {
+                "deficit_pts": round(d.deficit_pts, 2),
+                "span_pts": round(d.span_pts, 2),
+                "frac": round(d.frac, 3),
+                "effective_depth_mm": round(d.effective_depth_mm, 2),
+                "scaled_full_refill_min": round(d.minutes / d.frac, 1) if d.frac > 0 else None,
+                "source": d.source,
+            }
+        attributes["dosing"] = dosing_detail
+        cal_store = _read_efficacy_store()
+        calibration_detail = {}
+        for k in the_plan.watered:
+            crec = cal_store.get(k) or {}
+            calibration_detail[k] = {
+                "state": crec.get("state", "calibrating"),
+                "efficacy": crec.get("efficacy"),
+                "span_pts": crec.get("span_pts"),
+                "n_obs": crec.get("n_obs", 0),
+                "last_reject_reason": crec.get("last_reject_reason"),
+            }
+        attributes["calibration"] = calibration_detail
     if result is not None:
         attributes.update({
             "start": result.start, "end": result.end,
@@ -1405,28 +1625,25 @@ def _publish_last_run(stamp, trigger, ctx=None, result=None, outcome=None,
 def _rain_skip_check(ctx):
     """(should_skip, detail) for the plan in `ctx`.
 
-    The amount threshold is a fraction of the MEAN refill depth across the zones
-    actually planned tonight — it answers "would this rain substitute for
-    tonight's run?" rather than favouring the smallest or largest zone. With no
-    zones planned there is nothing to skip, so it returns False.
+    The amount threshold is a fraction of the deficit-proportional EFFECTIVE
+    delivered depth, averaged across the zones actually planned tonight — it
+    answers "would this rain substitute for tonight's run?" rather than
+    favouring the smallest or largest zone. With no zones planned there is
+    nothing to skip, so it returns False.
 
     Fails open: any unavailable forecast value yields False (see
     weather.is_rain_skip).
     """
-    cfg = ctx["cfg"]
     planned = ctx["the_plan"].watered
     if not planned:
         return False, {}
 
-    api_depths = ctx["refill_depths"]
+    doses = ctx["doses"]
     depths = []
     for key in planned:
-        zone_cfg = cfg.zones[key]
-        # Live Rachio depth preferred, static config.yaml seed as fallback —
-        # the same precedence used for runtimes.
-        depth = api_depths.get(zone_cfg.rachio_zone_id) or zone_cfg.refill_depth_mm
-        if depth > 0:
-            depths.append(depth)
+        eff = doses[key].effective_depth_mm
+        if eff > 0:
+            depths.append(eff)
     if not depths:
         return False, {}
     mean_depth = sum(depths) / len(depths)
@@ -1438,7 +1655,7 @@ def _rain_skip_check(ctx):
         "horizon_hours": horizon,
         "probability_pct": prob,
         "amount_mm": amount,
-        "mean_refill_depth_mm": round(mean_depth, 2),
+        "mean_effective_depth_mm": round(mean_depth, 2),
         "threshold_mm": round(ctx["tun"].rain_skip_refill_fraction * mean_depth, 2),
     }
     return skip, detail
@@ -1615,6 +1832,18 @@ def _plan_and_run(wait, trigger):
         # stranded on "watering", no "Run complete". The diagnostics exist for
         # exactly the nights that go wrong, so nothing fragile runs ahead of them.
         _publish_last_run(stamp, trigger, ctx=ctx, result=result, outcome=outcome)
+        if tun.self_calibration_enabled and watered:
+            measure_at = finished + dt.timedelta(hours=tun.settle_hours)
+            pend = []
+            for k in watered:
+                pend.append({
+                    "zone": k,
+                    "pre_dominant": ctx["dominant_by_zone"].get(k),
+                    "minutes": delivered.get(k, 0),
+                    "run_end_iso": finished.isoformat(),
+                    "measure_at_iso": measure_at.isoformat(),
+                })
+            _append_pending_obs(pend)
         _log_zone_outcomes(cfg, watered, delivered, uncompleted)
         aborted_reason = outcome["aborted_reason"]
         if aborted_reason:
@@ -1952,6 +2181,104 @@ def irrigation_calibrate():
 def irrigation_nightly():
     task.unique("irrigation_run")
     _plan_and_run(wait=True, trigger="nightly")
+
+
+@time_trigger("cron(0 9 * * *)")
+def _settle_and_learn():
+    """Read settled dominant for runs whose settle window has elapsed, reject
+    confounded observations, and update per-zone efficacy (feeds the learned span)."""
+    try:
+        cfg = config.parse_config(task.executor(_read_config_yaml, CONFIG_PATH))
+    except Exception as err:
+        log.warning(f"irrigation: settle-and-learn skipped; config load failed ({err})")
+        return
+    tun = cfg.tunables
+    if not tun.self_calibration_enabled:
+        return
+    pending = task.executor(_read_json, PENDING_OBS_PATH)
+    if not isinstance(pending, list) or not pending:
+        return
+    store = _read_efficacy_store()
+    api_runtimes = get_runtimes()
+    now = dt.datetime.now().astimezone()
+    rained = _rained_since_run(cfg.bindings, tun)
+    remaining = []
+    learned = 0
+    for rec in pending:
+        try:
+            measure_at = dt.datetime.fromisoformat(rec["measure_at_iso"])
+        except (KeyError, ValueError):
+            continue
+        if now < measure_at:
+            remaining.append(rec)
+            continue
+        try:
+            zone = rec.get("zone")
+            zone_cfg = cfg.zones.get(zone)
+            if zone_cfg is None:
+                continue
+            pre = rec.get("pre_dominant")
+            minutes = rec.get("minutes")
+            if pre is None or not minutes:
+                continue
+            signals = _read_zone_signals(zone_cfg)
+            reading = sensors.read_zone(zone_cfg, signals)
+            quals = [(q or "").strip() for q in signals.qualities]
+            qcn_training = (len(quals) == 3 and quals[0] == "Training"
+                            and quals[1] == "Training" and quals[2] == "Training")
+            sensor_ok = reading.online
+            settled = reading.dominant if reading.online else pre
+            obs = calibration.Observation(
+                zone=zone, pre_dominant=pre, minutes=minutes,
+                settled_dominant=settled, qcn_training=qcn_training,
+                rained=rained, sensor_ok=sensor_ok,
+            )
+            reason = calibration.classify(obs, tun)
+            zrec = store.get(zone) or {}
+            if reason == "ok":
+                prev = zrec.get("efficacy")
+                eff = calibration.update_efficacy(prev, obs, tun)
+                eff_obs = (settled - pre) / minutes
+                recent = (zrec.get("recent") or []) + [eff_obs]
+                if len(recent) > tun.convergence_samples:
+                    recent = recent[-tun.convergence_samples:]
+                base = api_runtimes.get(zone_cfg.rachio_zone_id) or zone_cfg.runtime_minutes
+                span = calibration.efficacy_to_span(eff, base)
+                span = max(tun.span_min, min(tun.span_max, span))
+                miss = zrec.get("miss_streak") or 0
+                if prev and prev > 0 and abs(eff_obs - prev) / prev > tun.convergence_tolerance:
+                    miss = miss + 1
+                else:
+                    miss = 0
+                conv = calibration.converged(recent, tun)
+                state_name = calibration.next_state(
+                    zrec.get("state", "calibrating"), conv, False, miss, tun)
+                zrec = {
+                    "state": state_name, "efficacy": eff, "span_pts": span,
+                    "recent": recent, "n_obs": (zrec.get("n_obs") or 0) + 1,
+                    "prior_minutes": minutes, "last_rise": (settled - pre),
+                    "miss_streak": miss,
+                    "last_updated": now.isoformat(), "last_reject_reason": None,
+                }
+                learned += 1
+            elif reason == "training":
+                zrec["state"] = calibration.next_state(
+                    zrec.get("state", "calibrating"), False, True, 0, tun)
+                zrec["efficacy"] = None
+                zrec["span_pts"] = 0
+                zrec["recent"] = []
+                zrec["miss_streak"] = 0
+                zrec["last_reject_reason"] = reason
+            else:
+                zrec = calibration.apply_reject(zrec, reason, minutes, settled - pre, tun)
+            store[zone] = zrec
+        except Exception as err:
+            log.warning(f"irrigation: settle-and-learn skipped a record ({err})")
+            continue
+    task.executor(_write_json_atomic, PENDING_OBS_PATH, remaining)
+    _write_efficacy_store(store)
+    if learned:
+        log.info(f"irrigation: settle-and-learn updated {learned} zone(s)")
 
 
 @time_trigger("startup")

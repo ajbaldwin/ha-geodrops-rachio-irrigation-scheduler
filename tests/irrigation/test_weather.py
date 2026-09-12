@@ -124,6 +124,19 @@ def test_rain_skip_scales_with_refill_depth():
     assert weather.is_rain_skip(90, 4.0, 8.89, T) is False
 
 
+def test_rain_skip_scales_with_delivered_depth():
+    # Regression lock: is_rain_skip scales with the depth it is given.
+    # When called with deficit-proportional effective depth (Task 6 rewiring),
+    # the proportional skip behavior is locked: a 4mm threshold becomes 2mm
+    # when the delivered depth drops from 8mm to 4mm.
+    t = T  # prob threshold 70, refill fraction 0.5
+    prob, amount = 80.0, 3.0
+    full_depth = 8.0      # threshold 4.0 -> 3.0 < 4.0 -> no skip
+    deficit_depth = 4.0   # threshold 2.0 -> 3.0 >= 2.0 -> skip
+    assert weather.is_rain_skip(prob, amount, full_depth, t) is False
+    assert weather.is_rain_skip(prob, amount, deficit_depth, t) is True
+
+
 def test_rain_skip_fails_open_on_missing_data():
     assert weather.is_rain_skip(None, 12.0, 7.58, T) is False
     assert weather.is_rain_skip(85, None, 7.58, T) is False

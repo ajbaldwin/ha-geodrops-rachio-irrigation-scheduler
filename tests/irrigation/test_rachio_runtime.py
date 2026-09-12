@@ -68,3 +68,21 @@ def test_parse_refill_depths_skips_missing_and_bad_values():
 
 def test_parse_refill_depths_empty_payload():
     assert rachio_runtime.parse_refill_depths([]) == {}
+
+
+def test_parse_refill_spans_basic():
+    zones = [{"id": "z1", "availableWater": 0.17, "managementAllowedDepletion": 0.5}]
+    spans = rachio_runtime.parse_refill_spans(zones)
+    assert spans["z1"] == 100.0 * 0.17 * 0.5  # 8.5 points
+
+
+def test_parse_refill_spans_skips_incomplete_and_tolerates_partial():
+    zones = [
+        {"id": "ok", "availableWater": 0.2, "managementAllowedDepletion": 0.5},
+        {"availableWater": 0.2, "managementAllowedDepletion": 0.5},   # no id
+        {"id": "no_aw", "managementAllowedDepletion": 0.5},           # no availableWater
+        {"id": "no_mad", "availableWater": 0.2},                      # no MAD
+        {"id": "bad", "availableWater": "x", "managementAllowedDepletion": 0.5},
+    ]
+    spans = rachio_runtime.parse_refill_spans(zones)
+    assert spans == {"ok": 10.0}

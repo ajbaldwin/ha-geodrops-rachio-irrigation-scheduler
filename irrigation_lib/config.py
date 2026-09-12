@@ -63,6 +63,49 @@ class Tunables:
     # cap, observed 2026-08-27). Re-issue a fresh schedule for the remaining
     # water up to this many times per run. 0 disables recovery (abort as before).
     max_schedule_retries: int = 2
+    # Default refill target on the `dominant` scale when a zone sets none. Wet-band
+    # low: full but short of the waterlogged Wet+ range. Overridable per zone.
+    field_capacity_pct: float = 87.0
+    # Active Watering Calibration (BETA): each zone learns its own dosing span
+    # from real soil response instead of the Rachio-derived span. Defaults OFF —
+    # opt in per yard once you've watched a few nights of probing behavior.
+    self_calibration_enabled: bool = False
+    # Fraction of the zone's full-refill runtime for the FIRST probe (~1/3 lands a
+    # measurable rise in the linear region on night one, clear of the no_rise floor).
+    probe_fraction: float = 1.0 / 3.0
+    # Minimum duration per probe cycle, in minutes.
+    probe_floor_minutes: float = 10.0
+    # Growth rate per calibration cycle: multiplier for next probe size after a
+    # sub-measurable rise.
+    probe_growth: float = 1.5
+    # Shrink divisor after a saturated probe: symmetric to probe_growth so an
+    # over-large probe self-corrects downward instead of stalling.
+    probe_shrink: float = 1.5
+    # Minimum points rise to be measurable in soil moisture signal.
+    measurable_rise_pts: float = 3.0
+    # Hours to allow soil settling before evaluating response to watering.
+    settle_hours: float = 4.0
+    # EWMA smoothing factor for calibration convergence.
+    calibration_ewma_alpha: float = 0.3
+    # Tolerance threshold for convergence detection.
+    convergence_tolerance: float = 0.10
+    # Number of converged samples to declare tuning complete.
+    convergence_samples: int = 3
+    # Dominant level below which a zone may be probed.
+    probe_headroom_ceiling: float = 85.0
+    # Upper threshold to reject saturation-state reads.
+    saturation_reject: float = 95.0
+    # Minimum span (range of refill dosing) in points.
+    span_min: float = 1.0
+    # Maximum span (range of refill dosing) in points.
+    span_max: float = 60.0
+    # Daily rain accumulation (mm) over the settle window above which a
+    # calibration observation is rejected as rain-confounded.
+    rain_confounder_mm: float = 0.5
+    # A zone excluded (see ZoneConfig.exclude_boolean) for at least this many
+    # hours is reset to recalibrating on return (soil likely changed, e.g.
+    # overseed); a shorter/accidental exclusion keeps its learned calibration.
+    recalibrate_after_exclusion_hours: float = 48.0
 
 
 # Where a run's watering window ENDS, per drought profile. Dawn is the earlier
@@ -130,10 +173,20 @@ class ZoneConfig:
     # Full-refill depth in mm (Rachio `depthOfWater`), seeded statically here and
     # preferred from the live pull when available — mirrors runtime_minutes.
     refill_depth_mm: float = 0.0
+    # Deficit-proportional dosing. refill_target_pct: the `dominant` value to
+    # refill TO; None inherits Tunables.field_capacity_pct. refill_span_pts: the
+    # `dominant` points a full refill buys; 0.0 = derive from Rachio (live) else
+    # full-refill fallback. Same "0/None = unset" idiom as runtime_minutes.
+    refill_target_pct: float | None = None
+    refill_span_pts: float = 0.0
     # True for zones whose spray the Tempest can misread as rain (the rain gate
     # corroborates such a zone with the gauge, not RH). Defaulted so existing
     # constructions and configs without the key stay valid.
     spray: bool = False
+    # Entity id of a boolean that, when "on", EXCLUDES this zone from the nightly
+    # plan AND calibration probing (e.g. an overseeded zone watered separately).
+    # Empty = never excluded. Missing/unavailable entity fails safe to included.
+    exclude_boolean: str = ""
 
 
 @dataclass(frozen=True)
@@ -143,6 +196,11 @@ class WeatherEntities:
     wind: str = "sensor.tempest_sensor_wind_speed_average"
     rain_last_hour: str = "sensor.tempest_rain_last_hour"
     precip_type: str = "sensor.tempest_sensor_precipitation_type"
+    # Daily rain accumulation (resets at midnight). Read at the mid-morning
+    # settle pass to detect rain over the overnight run->settle window (a real
+    # windowed signal, unlike rain_last_hour), for calibration confounder
+    # rejection. Override for a non-Tempest gauge.
+    rain_today: str = "sensor.tempest_precipitation_today"
 
 
 @dataclass(frozen=True)
@@ -211,6 +269,7 @@ def parse_bindings(raw: dict) -> HABindings:
         "wind": WeatherEntities().wind,
         "rain_last_hour": WeatherEntities().rain_last_hour,
         "precip_type": WeatherEntities().precip_type,
+        "rain_today": WeatherEntities().rain_today,
     }, w))
     sun = SunAnchors(**_merge({"dawn": SunAnchors().dawn,
                                "sunrise": SunAnchors().sunrise}, s))
@@ -266,6 +325,12 @@ def parse_config(raw: dict) -> Config:
             runtime_minutes=float(z["runtime_minutes"]),
             rachio_zone_id=z.get("rachio_zone_id", ""),
             refill_depth_mm=float(z.get("refill_depth_mm", 0.0)),
+            refill_target_pct=(
+                None if z.get("refill_target_pct") is None
+                else float(z["refill_target_pct"])
+            ),
+            refill_span_pts=float(z.get("refill_span_pts", 0.0)),
+            exclude_boolean=z.get("exclude_boolean", ""),
             spray=bool(z.get("spray", False)),
         )
     return Config(bands=bands, tunables=tunables, zones=zones, drought_profiles=profiles, bindings=parse_bindings(raw))

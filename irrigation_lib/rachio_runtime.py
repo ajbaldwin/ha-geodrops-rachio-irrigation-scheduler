@@ -54,3 +54,29 @@ def parse_refill_depths(zones_json: list) -> dict:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def parse_refill_spans(zones_json: list) -> dict:
+    """Map each Rachio zone `id` -> refill span in `dominant` points.
+
+    A full Rachio refill raises soil moisture by `availableWater * MAD` of the
+    root zone; expressed on the 0-100 `dominant` scale that is
+    `100 * availableWater * managementAllowedDepletion` (root depth cancels).
+    This is the denominator of the deficit fraction in `dosing.dose_zone`.
+
+    Zones without an `id`, or without numeric `availableWater` and
+    `managementAllowedDepletion`, are skipped, so a partial payload degrades to
+    fewer entries rather than raising.
+    """
+    result = {}
+    for zone in zones_json:
+        zone_id = zone.get("id")
+        aw = zone.get("availableWater")
+        mad = zone.get("managementAllowedDepletion")
+        if not zone_id or aw is None or mad is None:
+            continue
+        try:
+            result[zone_id] = 100.0 * float(aw) * float(mad)
+        except (TypeError, ValueError):
+            continue
+    return result

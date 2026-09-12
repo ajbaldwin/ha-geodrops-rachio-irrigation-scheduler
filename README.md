@@ -20,6 +20,14 @@ readings instead of a fixed clock.
   infiltration.
 - Aborts a run in progress if the Tempest weather station's rain gauge
   detects real rain starting mid-run.
+- Lets you exclude any zone from both the nightly plan and calibration
+  probing with a toggle helper — e.g. an overseeded zone you're watering
+  separately with a lighter, more frequent schedule.
+- **Active Watering Calibration (Beta, off by default):** each zone can
+  learn its own dosing span from its actual soil-moisture response,
+  replacing the Rachio-derived estimate. See [Enabling Active Watering
+  Calibration](#enabling-active-watering-calibration-beta) before turning
+  it on.
 
 ## Prerequisites
 
@@ -68,7 +76,13 @@ readings instead of a fixed clock.
      controller's device name) and `run_active_boolean` (the helper created
      in step 3, if you kept the default entity id).
    - The `zones:` section — one entry per Rachio zone you want the
-     scheduler to manage, with your own zone IDs and sensor bindings.
+     scheduler to manage, with your own zone IDs and sensor bindings. Each
+     zone may optionally set `exclude_boolean` to an `input_boolean` entity
+     id — turning that helper on pulls the zone out of both the nightly
+     plan and calibration probing (e.g. for an overseeded zone you're
+     watering separately). Omit it and the zone can never be excluded this
+     way. Create the helper yourself (Helpers UI) for any zone you want
+     this on.
    - The `drought_profiles:` section (optional to tune) — each level sets when
      its watering window ends via `end_anchor` (`dawn` or `sunrise`) and an
      optional `end_offset_minutes` (positive = minutes before the anchor,
@@ -82,6 +96,40 @@ readings instead of a fixed clock.
    the pyscript app. (Afterwards, for changes to the app code alone,
    `pyscript.reload` is enough — but any change to the package entities still
    needs a restart.)
+
+## Enabling Active Watering Calibration (Beta)
+
+**Off by default.** This feature is new, still being validated against real
+yards, and changes how much water your zones actually receive — read this
+before turning it on.
+
+What it does: instead of trusting the Rachio-derived dosing span, each zone
+runs small "probe" waterings, measures the resulting soil-moisture rise, and
+learns its own points-per-minute efficacy from that. Over a few nights it
+converges on a dosing span tuned to your actual soil, sensor placement, and
+sprinkler output — which can differ substantially from Rachio's estimate.
+
+Why it's Beta: the probe-sizing logic is new and, while unit-tested, hasn't
+been observed across enough different soil types and zone geometries to
+trust as a default. A zone that never registers a measurable rise, or one
+whose sensor is noisy, can take longer to converge than expected while it
+runs smaller-than-normal watering doses in the meantime.
+
+To enable it:
+
+1. Set `tunables.self_calibration_enabled: true` in `config.yaml`.
+2. Watch the calibrating zone(s) for several nights before trusting the
+   result. The state of each zone's calibration is queryable from the
+   scheduler's status attributes (`state`, `n_obs`, `efficacy`, and
+   `last_reject_reason` if a probe was rejected — e.g. `no_rise`,
+   `saturated`, `rain`).
+3. If you'd rather exclude a specific zone from calibration entirely while
+   still probing others, give that zone `refill_span_pts` a nonzero value
+   in its `zones:` entry (pins it to a fixed dosing span) or set its
+   `exclude_boolean` helper on.
+4. If it isn't behaving as expected, set `self_calibration_enabled: false`
+   to fall back to the original Rachio-derived dosing at any time — nothing
+   else about the schedule changes.
 
 ## Advanced: renaming the stop button or the schedule times
 

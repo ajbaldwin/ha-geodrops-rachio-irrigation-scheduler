@@ -90,9 +90,11 @@ def is_rain_skip(prob_pct, amount_mm, refill_depth_mm, t: Tunables) -> bool:
     alone cannot distinguish a 70% chance of a 0.2mm trace from a 70% chance of
     15mm, and only the latter refills the root zone.
 
-    The amount threshold is a fraction of `refill_depth_mm` — the water that must
-    enter the soil to refill the root zone (Rachio's `depthOfWater`) — so it is
-    proportional to what a run would actually deliver rather than a fixed depth.
+    The amount threshold is a fraction of `refill_depth_mm` — here the depth this
+    run would actually DELIVER tonight (the deficit-proportional effective depth,
+    supplied by the caller), not a full refill — so rain-skip and dosing agree on
+    how much water tonight needs. A lightly depleted zone needs less forecast rain
+    to justify skipping.
 
     Fails OPEN: any missing input, or a non-positive refill depth (no zones
     planned, or depths unavailable), returns False so watering proceeds. A

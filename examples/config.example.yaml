@@ -66,6 +66,11 @@ tunables:
   max_pause_minutes: 60
   # 0 = unbounded (one schedule); >0 = fallback split strategy.
   max_pauses_per_schedule: 0
+  # Active Watering Calibration (BETA, off by default): each zone learns its
+  # own dosing span from real soil-moisture response instead of the
+  # Rachio-derived estimate. See the README section "Enabling Active
+  # Watering Calibration (Beta)" before turning this on.
+  self_calibration_enabled: false
 
 # ------------------------------------------------------------------------------
 # drought_profiles: keys MUST match your input_select.irrigation_drought_level
@@ -189,6 +194,11 @@ homeassistant:
 #                       zone's spray pattern can hit your weather station and
 #                       make it misreport spray as rain — see
 #                       tunables.rain_last_hour_mm above
+#   exclude_boolean    (optional, defaults to unset) input_boolean entity id;
+#                       turning it on pulls this zone out of both the nightly
+#                       plan and Active Watering Calibration probing (e.g. an
+#                       overseeded zone you're watering separately). Omit the
+#                       key and the zone can never be excluded this way.
 # ------------------------------------------------------------------------------
 zones:
   zone_a:
@@ -240,3 +250,7 @@ zones:
     rachio_zone_id: "00000000-0000-0000-0000-000000000000"
     refill_depth_mm: 8.89
     spray: true
+    # Illustrates exclude_boolean: create this helper and turn it on to pull
+    # zone_c out of the nightly plan and calibration probing (e.g. while
+    # overseeded and hand-watered on a different schedule).
+    exclude_boolean: input_boolean.irrigation_exclude_zone_c

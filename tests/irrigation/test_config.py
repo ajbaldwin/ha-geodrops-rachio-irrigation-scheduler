@@ -195,6 +195,18 @@ def test_bindings_override_is_shallow_merged():
     assert b.weather.temperature == "sensor.tempest_sensor_temperature"
 
 
+def test_bindings_rain_today_default_and_override():
+    assert config.parse_bindings({}).weather.rain_today == "sensor.tempest_precipitation_today"
+    raw = {"homeassistant": {"weather": {"rain_today": "sensor.my_daily_rain"}}}
+    b = config.parse_bindings(raw)
+    assert b.weather.rain_today == "sensor.my_daily_rain"
+    assert b.weather.rain_last_hour == "sensor.tempest_rain_last_hour"  # sibling default kept
+
+
+def test_rain_confounder_mm_default():
+    assert config.parse_config(_raw()).tunables.rain_confounder_mm == 0.5
+
+
 def test_bindings_default_device_name_is_placeholder():
     assert config.HABindings().rachio_device_name == "PLACEHOLDER"
 
@@ -264,3 +276,73 @@ def test_max_schedule_retries_defaults_to_two():
 def test_max_schedule_retries_is_overridable():
     from irrigation_lib.config import Tunables
     assert Tunables(max_schedule_retries=0).max_schedule_retries == 0
+
+
+def _raw():
+    return {
+        "bands": {"moist": {"low": 67, "high": 76}},
+        "tunables": {"field_capacity_pct": 90.0},
+        "drought_profiles": {
+            "L0": {"target_offset": 0, "trigger_margin": 0, "runtime_scale": 1.0}
+        },
+        "zones": {
+            "zone_a": {
+                "rachio_switch": "switch.a", "dominant_sensor": "sensor.a_dom",
+                "state_sensor": "sensor.a_state",
+                "quality_sensors": ["sensor.a_q1", "sensor.a_q2", "sensor.a_q3"],
+                "target_range": "moist", "geography": "front", "adjacency": [],
+                "runtime_minutes": 20.0, "refill_target_pct": 85.0,
+                "refill_span_pts": 12.0,
+            },
+            "zone_b": {  # omits the new zone keys -> defaults
+                "rachio_switch": "switch.b", "dominant_sensor": "sensor.b_dom",
+                "state_sensor": "sensor.b_state",
+                "quality_sensors": ["sensor.b_q1", "sensor.b_q2", "sensor.b_q3"],
+                "target_range": "moist", "geography": "back", "adjacency": [],
+                "runtime_minutes": 20.0,
+            },
+        },
+    }
+
+
+def test_field_capacity_pct_parsed():
+    c = config.parse_config(_raw())
+    assert c.tunables.field_capacity_pct == 90.0
+
+
+def test_field_capacity_pct_defaults_to_87():
+    raw = _raw()
+    raw["tunables"] = {}
+    c = config.parse_config(raw)
+    assert c.tunables.field_capacity_pct == 87.0
+
+
+def test_zone_refill_target_and_span_parsed_with_defaults():
+    c = config.parse_config(_raw())
+    assert c.zones["zone_a"].refill_target_pct == 85.0
+    assert c.zones["zone_a"].refill_span_pts == 12.0
+    assert c.zones["zone_b"].refill_target_pct is None
+    assert c.zones["zone_b"].refill_span_pts == 0.0
+
+
+def test_self_calibration_tunables_defaults():
+    c = config.parse_config(_raw())
+    t = c.tunables
+    assert t.self_calibration_enabled is False  # Beta: Active Watering Calibration, opt-in
+    assert t.probe_fraction == pytest.approx(1 / 3)
+    assert t.probe_shrink == 1.5
+    assert t.probe_floor_minutes == 10.0
+    assert t.convergence_tolerance == 0.10
+    assert t.span_max == 60.0
+
+
+def test_recalibrate_after_exclusion_hours_default():
+    assert config.parse_config(_raw()).tunables.recalibrate_after_exclusion_hours == 48.0
+
+
+def test_zone_exclude_boolean_default_and_override():
+    raw = _raw()
+    raw["zones"]["zone_a"]["exclude_boolean"] = "input_boolean.irrigation_exclude_zone_a"
+    c = config.parse_config(raw)
+    assert c.zones["zone_a"].exclude_boolean == "input_boolean.irrigation_exclude_zone_a"
+    assert c.zones["zone_b"].exclude_boolean == ""  # default when key omitted
