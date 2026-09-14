@@ -2504,7 +2504,13 @@ def irrigation_refresh_runtimes():
 
 
 @state_trigger("input_button.irrigation_stop")
-def _on_stop_button():
+def _on_stop_button(value=None):
+    # A real press sets the button to a timestamp. Ignore the startup / reload /
+    # unavailable transitions — HA re-creates the button as "unknown" on every
+    # restart, which would otherwise raise the manual-stop flag and abort a live
+    # run with no one having pressed anything.
+    if not value or value in ("unknown", "unavailable"):
+        return
     global _manual_stop
     _manual_stop = True
     _activity("Stop button pressed")
