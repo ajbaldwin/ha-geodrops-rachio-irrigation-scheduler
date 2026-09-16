@@ -24,6 +24,11 @@ class RunResult:
     window_start: str = ""
     window_end: str = ""
     window_hours: float = 0.0
+    # Full, tz-aware ISO instant when watering actually finished (valve close),
+    # e.g. "2026-09-16T04:55:03-04:00". The time-only `end` above is for human
+    # display; end_iso is what a TIMESTAMP consumer (the wrapper's Last Watered
+    # sensor) parses. Empty on nights nothing watered (standby / rain-skip).
+    end_iso: str = ""
     # How many times the collapsed Rachio schedule was dropped mid-run and
     # re-issued. 0 on a healthy night; defaulted so existing constructions stay
     # valid.

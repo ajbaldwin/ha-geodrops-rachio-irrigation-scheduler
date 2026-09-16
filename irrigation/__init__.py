@@ -126,11 +126,15 @@ _current_tun = None  # tunables of the in-flight run; read by _is_rain()
 # way to reach the loaded config.
 _current_cfg = None       # the loaded Config (spray_switches() etc.)
 _current_bindings = None  # _current_cfg.bindings — entity/service ids
-_run_in_progress = False  # True only while _plan_and_run() owns the run-
-                           # scoped globals above; _preview/irrigation_
-                           # calibrate/irrigation_refresh_runtimes check this
-                           # before touching them, so they never clobber a
-                           # run's bindings mid-watch.
+_run_in_progress = False  # True for the WHOLE nightly run, incl. the multi-hour
+                           # pre-dawn wait; irrigation_calibrate/_refresh_runtimes
+                           # check this before touching the run-scoped globals so
+                           # they never clobber a run's bindings mid-watch.
+_watering_active = False   # True ONLY while valves are actually watering (not
+                           # during planning or the pre-dawn wait). _preview()
+                           # gates on this, not _run_in_progress, so a preview
+                           # can answer "what would run?" while the night is still
+                           # Planned — but is refused once water is flowing.
 _rain_since = None   # when the rain condition first went true (sustain clock)
 
 
@@ -1591,6 +1595,10 @@ def _publish_last_run(stamp, trigger, ctx=None, result=None, outcome=None,
     if result is not None:
         attributes.update({
             "start": result.start, "end": result.end,
+            # Full tz-aware valve-close instant (empty on no-water nights). The
+            # wrapper's Last Watered TIMESTAMP sensor parses this; `end` is the
+            # time-only human string, which a TIMESTAMP sensor cannot read.
+            "end_iso": result.end_iso,
             "window_start": result.window_start, "window_end": result.window_end,
             "watered": result.watered,
             "delivered_minutes": result.per_zone_minutes,
@@ -1665,7 +1673,7 @@ def _plan_and_run(wait, trigger):
     """Plan and water. `wait=True` (nightly) sleeps until the pre-dawn window;
     `wait=False` (run-now) executes immediately."""
     global _manual_stop, _current_tun, _current_cfg, _current_bindings
-    global _rain_since, _run_in_progress
+    global _rain_since, _run_in_progress, _watering_active
     _manual_stop = False
     _rain_since = None  # fresh sustain clock; a stale one could abort instantly
     reset_counters()
@@ -1754,6 +1762,14 @@ def _plan_and_run(wait, trigger):
                 # The wait is over (whichever branch follows). Clear the marker so
                 # a later restart cannot re-arm a run that already left waiting.
                 _clear_waiting_marker()
+                # Re-establish this run's own bindings before reading them below.
+                # A preview fired during the wait save/restores these globals, but
+                # pyscript yields at every await inside preview — so if the sleep
+                # expired mid-preview, control could return here with preview's
+                # config still installed. Re-assigning synchronously (no await
+                # before the watering reads) makes the run own its context again.
+                _current_cfg = cfg
+                _current_bindings = cfg.bindings
 
             # The plan was built at 23:00 but watering starts hours later, and the
             # forecast refreshes every 15 minutes. Without this, a forecast that
@@ -1790,6 +1806,9 @@ def _plan_and_run(wait, trigger):
         # they describe. RunResult.start is documented as "when watering actually
         # began"; now it is.
         began = dt.datetime.now().astimezone()
+        # From here until the finally, valves may open. A preview is refused for
+        # this span (it would clobber the run-scoped globals a live run reads).
+        _watering_active = True
         _set_status("watering", detail=f"{len(the_plan.watered)} zone(s)")
         if cfg.tunables.use_pause_collapse:
             outcome = run_collapsed(
@@ -1817,6 +1836,9 @@ def _plan_and_run(wait, trigger):
             watered=watered, uncompleted=uncompleted,
             start=began.strftime("%H:%M"),
             end=finished.strftime("%H:%M"),
+            # Full tz-aware valve-close instant for the wrapper's Last Watered
+            # sensor; the time-only `end` above stays for human display.
+            end_iso=finished.isoformat(),
             per_zone_minutes={k: delivered.get(k, 0) for k in watered}, standby=False,
             # The disease window that was available, reported separately from the
             # actual watering times (which collapse to a point when nothing ran).
@@ -1862,6 +1884,7 @@ def _plan_and_run(wait, trigger):
             ended_at=finished if watered else None,
         )
     finally:
+        _watering_active = False
         _run_in_progress = False
 
 
@@ -1875,18 +1898,37 @@ def _preview():
         untruncated breakdown incl. the dynamic-window characteristics.
     """
     global _current_cfg, _current_bindings
-    if _run_in_progress:
-        msg = "Preview skipped — an irrigation run is already in progress."
+    # Only refuse while valves are actually watering — NOT during the pre-dawn
+    # wait. A Planned/waiting night is exactly when "what would run tonight?"
+    # is worth asking; blocking it there (the old _run_in_progress guard) left
+    # preview silent for hours every night.
+    if _watering_active:
+        msg = "Preview skipped — valves are watering right now."
         _notify(msg, "Irrigation Preview")
-        _activity("Preview skipped: run in progress")
+        _activity("Preview skipped: watering in progress")
         return
     stamp = dt.datetime.now().isoformat(timespec="seconds")
     cfg = config.parse_config(task.executor(_read_config_yaml, CONFIG_PATH))
-    # Preview runs outside _plan_and_run, so it must load these globals itself —
-    # every entity read below (_is_standby, _plan_context's weather/forecast/sun
-    # reads, the notify call) goes through _current_bindings, not a local.
+    # _is_standby, _plan_context's weather/forecast/sun reads and the notify
+    # call all reach the loaded config through the run-scoped globals, so a
+    # preview fired during a run's pre-dawn wait must not leave them mutated:
+    # save, set, restore around the body. The waiting run ALSO re-establishes
+    # its own bindings right after its sleep, closing the narrow case where the
+    # sleep expires mid-preview (pyscript yields at every await in the body).
+    _saved_cfg, _saved_bindings = _current_cfg, _current_bindings
     _current_cfg = cfg
     _current_bindings = cfg.bindings
+    try:
+        _preview_body(cfg, stamp)
+    finally:
+        _current_cfg = _saved_cfg
+        _current_bindings = _saved_bindings
+
+
+def _preview_body(cfg, stamp):
+    """The preview computation itself, split out so _preview() can wrap it in a
+    save/restore of the run-scoped globals (_current_cfg/_current_bindings) this
+    body reads through _is_standby / _plan_context / _notify."""
     if _is_standby():
         msg = "System in Standby — a run would water nothing."
         _notify(msg, "Irrigation Preview")

@@ -228,3 +228,17 @@ def test_a_naive_fallback_still_yields_one_consistent_timezone():
 
     assert start.utcoffset() is not None
     assert start.utcoffset() == end.utcoffset()
+
+
+def test_run_result_end_iso_defaults_empty():
+    # Standby / rain-skip / no-water constructions never set end_iso, so the
+    # field must default to "" (no watering happened, nothing to timestamp).
+    assert result().end_iso == ""
+
+
+def test_run_result_carries_full_iso_watering_end():
+    # The record's time-only `end` ("04:55") can't be parsed by a TIMESTAMP
+    # sensor; end_iso carries the tz-aware valve-close instant for the wrapper.
+    r = result(end="04:55", end_iso="2026-09-16T04:55:03-04:00")
+    assert r.end == "04:55"
+    assert r.end_iso == "2026-09-16T04:55:03-04:00"
