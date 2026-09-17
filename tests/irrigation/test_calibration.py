@@ -73,6 +73,41 @@ def test_should_probe():
 import datetime as _dt
 
 
+def _t(h):
+    # tz-aware helper: a fixed base datetime plus h hours (UTC).
+    base = _dt.datetime(2026, 9, 17, 0, 0, tzinfo=_dt.timezone.utc)
+    return base + _dt.timedelta(hours=h)
+
+
+def test_settle_decision_waits_before_ripe():
+    # now < measure_at -> not ripe yet, regardless of freshness
+    assert calibration.settle_decision(_t(3), _t(4), _t(5), 12.0) == "wait"
+
+
+def test_settle_decision_measures_when_ripe_and_fresh():
+    # ripe (now >= measure_at) and a genuine post-settle sample (last_updated >= measure_at)
+    assert calibration.settle_decision(_t(5), _t(4), _t(4), 12.0) == "measure"     # boundary: last_updated == measure_at
+    assert calibration.settle_decision(_t(6), _t(4), _t(5), 12.0) == "measure"
+
+
+def test_settle_decision_waits_when_ripe_but_stale():
+    # ripe but the only sample predates measure_at, still before the deadline
+    assert calibration.settle_decision(_t(6), _t(4), _t(1), 12.0) == "wait"
+    # sensor last_updated unreadable -> treated as not fresh
+    assert calibration.settle_decision(_t(6), _t(4), None, 12.0) == "wait"
+
+
+def test_settle_decision_expires_at_deadline_without_fresh_sample():
+    # deadline = measure_at + max_wait = _t(4) + 12h = _t(16)
+    assert calibration.settle_decision(_t(16), _t(4), _t(1), 12.0) == "expired"   # boundary: now == deadline
+    assert calibration.settle_decision(_t(20), _t(4), None, 12.0) == "expired"
+
+
+def test_settle_decision_measures_even_past_deadline_if_fresh():
+    # a fresh sample always wins over the deadline (we can still learn)
+    assert calibration.settle_decision(_t(20), _t(4), _t(18), 12.0) == "measure"
+
+
 def test_exclusion_return_resets_after_threshold():
     now = _dt.datetime(2026, 9, 20, 12, 0, 0)
     rec = {"state": "converged", "efficacy": 0.5, "span_pts": 20.0,

@@ -85,6 +85,12 @@ class Tunables:
     measurable_rise_pts: float = 3.0
     # Hours to allow soil settling before evaluating response to watering.
     settle_hours: float = 4.0
+    # How long past measure_at (run_end + settle_hours) the settle poll will keep
+    # waiting for a genuine post-settle sensor report before giving up on an
+    # observation. On timeout the obs is DROPPED (inconclusive) — never rejected —
+    # so a missed GeoDrops check-in can't corrupt the model. Sized to clear the
+    # observed worst-case ~6h missed check-in plus settle.
+    settle_max_wait_hours: float = 12.0
     # EWMA smoothing factor for calibration convergence.
     calibration_ewma_alpha: float = 0.3
     # Tolerance threshold for convergence detection.

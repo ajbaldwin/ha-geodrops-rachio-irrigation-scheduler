@@ -225,3 +225,32 @@ def should_probe(state: str, dominant_now: float, pinned: bool, t) -> bool:
         return False
 
     return True
+
+
+def settle_decision(now, measure_at, last_updated, max_wait_hours) -> str:
+    """Decide how to handle one pending calibration observation at this poll.
+
+    All datetimes are tz-aware (aware/aware comparisons only). `last_updated` is
+    the dominant sensor's HA last_updated (bumps on a value change, so it tracks
+    genuine device check-ins) or None when it cannot be read.
+
+    Returns:
+      "wait"     - not ripe yet (now < measure_at), OR ripe but no genuine
+                   post-settle sample (last_updated < measure_at or None) and the
+                   deadline has not passed. Keep the obs pending.
+      "measure"  - ripe AND a genuine post-settle sample exists
+                   (last_updated >= measure_at). Read + classify it.
+      "expired"  - ripe, still no fresh sample, and now >= measure_at + max_wait.
+                   Drop the obs (never reject, never touch the model).
+
+    A fresh sample always yields "measure", even past the deadline: if we can
+    learn cleanly we should, regardless of how long it took to arrive.
+    """
+    if now < measure_at:
+        return "wait"
+    if last_updated is not None and last_updated >= measure_at:
+        return "measure"
+    deadline = measure_at + dt.timedelta(hours=max_wait_hours)
+    if now >= deadline:
+        return "expired"
+    return "wait"
