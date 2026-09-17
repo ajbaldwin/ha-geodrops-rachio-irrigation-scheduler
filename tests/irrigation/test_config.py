@@ -278,6 +278,11 @@ def test_max_schedule_retries_is_overridable():
     assert Tunables(max_schedule_retries=0).max_schedule_retries == 0
 
 
+def test_settle_max_wait_hours_default():
+    from irrigation_lib.config import Tunables
+    assert Tunables().settle_max_wait_hours == 12.0
+
+
 def _raw():
     return {
         "bands": {"moist": {"low": 67, "high": 76}},

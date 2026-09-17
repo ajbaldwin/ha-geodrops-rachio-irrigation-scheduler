@@ -1186,6 +1186,21 @@ def _read_zone_signals(zone):
     )
 
 
+def _sensor_last_updated(entity):
+    """The HA `last_updated` (tz-aware UTC datetime) of a state entity, or None.
+
+    pyscript exposes it as a virtual attribute via state.get("<entity>.last_updated").
+    We use last_updated (bumps only when the value changes) — NOT last_reported
+    (bumps on every MQTT republish, which would defeat the freshness gate). Any
+    failure (missing entity -> NameError, or unexpected type) yields None, which
+    settle_decision treats as "not fresh".
+    """
+    try:
+        return state.get(entity + ".last_updated")
+    except Exception:
+        return None
+
+
 def _dawn_time():
     return dt.datetime.fromisoformat(state.get(_current_bindings.sun.dawn))
 
@@ -2272,7 +2287,7 @@ def irrigation_nightly():
     _plan_and_run(wait=True, trigger="nightly")
 
 
-@time_trigger("cron(0 9 * * *)")
+@time_trigger("cron(*/30 * * * *)")
 def _settle_and_learn():
     """Read settled dominant for runs whose settle window has elapsed, reject
     confounded observations, and update per-zone efficacy (feeds the learned span)."""
@@ -2288,24 +2303,35 @@ def _settle_and_learn():
     if not isinstance(pending, list) or not pending:
         return
     store = _read_efficacy_store()
-    api_runtimes = get_runtimes()
     now = dt.datetime.now().astimezone()
-    rained = _rained_since_run(cfg.bindings, tun)
+    api_runtimes = None      # lazy: only fetched once an obs is ready to measure
+    rained = None            # lazy: same
     remaining = []
     learned = 0
+    dropped = 0
     for rec in pending:
         try:
             measure_at = dt.datetime.fromisoformat(rec["measure_at_iso"])
         except (KeyError, ValueError):
             continue
-        if now < measure_at:
+        zone = rec.get("zone")
+        zone_cfg = cfg.zones.get(zone)
+        if zone_cfg is None:
+            continue  # obs for a zone no longer configured: drop it
+        last_updated = _sensor_last_updated(zone_cfg.dominant_sensor)
+        decision = calibration.settle_decision(
+            now, measure_at, last_updated, tun.settle_max_wait_hours)
+        if decision == "wait":
             remaining.append(rec)
             continue
+        if decision == "expired":
+            dropped += 1
+            continue  # inconclusive: drop, never reject, no model change
+        # decision == "measure": fall through to the accept/reject path below
+        if api_runtimes is None:
+            api_runtimes = get_runtimes()
+            rained = _rained_since_run(cfg.bindings, tun)
         try:
-            zone = rec.get("zone")
-            zone_cfg = cfg.zones.get(zone)
-            if zone_cfg is None:
-                continue
             pre = rec.get("pre_dominant")
             minutes = rec.get("minutes")
             if pre is None or not minutes:
@@ -2366,8 +2392,10 @@ def _settle_and_learn():
             continue
     task.executor(_write_json_atomic, PENDING_OBS_PATH, remaining)
     _write_efficacy_store(store)
-    if learned:
-        log.info(f"irrigation: settle-and-learn updated {learned} zone(s)")
+    if learned or dropped:
+        log.info(
+            f"irrigation: settle-and-learn updated {learned} zone(s), "
+            f"dropped {dropped} inconclusive")
 
 
 @time_trigger("startup")
