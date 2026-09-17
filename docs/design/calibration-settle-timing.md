@@ -1,8 +1,7 @@
 # Calibration settle timing — design note (unbuilt)
 
-Status: **brainstormed 2026-09-17, not implemented.** Captures the problem, the
-real hardware behaviour, the options considered, and the open questions, so this
-can be picked up later.
+Status: **implemented 2026-09-17** (see `docs/superpowers/plans/2026-09-17-calibration-settle-timing.md`). Captures the problem, the
+real hardware behaviour, the options considered, and resolutions to all feasibility questions.
 
 ## Background: how a calibration probe is accepted/rejected today
 
@@ -99,24 +98,24 @@ Build the **freshness-gated measurement on a frequent poll**, regardless of D:
 Then, if the integration supports it, layer **D** (early check-in trigger) on top
 to shorten the wait and cut missed-checkin dependence.
 
-## Open questions / feasibility (resolve before building)
+## Open questions / feasibility (resolved)
 
-1. **Is there an HA-triggerable "read now" for a GeoDrops sensor** (a service,
-   MQTT command, or button)? If yes, D becomes primary. If no, ship the
-   freshness-gate + deadline as the robust floor.
-2. **pyscript access to `last_updated`:** `sensors.read_zone` must surface each
-   reading's `last_updated` so the freshness gate can compare it to `measure_at`.
-   Confirm the pyscript state-metadata API for this (load-bearing).
-3. **Deadline sizing** (`max_wait`) — past a realistic missed-checkin gap without
-   holding obs forever.
-4. **`settle_hours` vs sensor cadence** — with ~2–4h+ irregular reporting,
-   `settle_hours=4` is roughly one poll interval; the effective settled reading is
-   "the first genuine report ≥ settle_hours after watering." Revisit whether a
-   fixed offset is even the right model vs "first fresh post-water sample after a
-   minimum redistribution time."
-5. **New inconclusive/stale outcome** must route to defer/drop, and must never
-   count toward `miss_streak` or convergence in a way that penalises a zone for a
-   sensor gap.
+1. **Is there an HA-triggerable "read now" for a GeoDrops sensor?**
+   Resolved: no HA-triggerable read-now. `ha-geodrops-integration` is one-way BigQuery→MQTT; Option D dropped; fix is scheduler-only.
+
+2. **pyscript access to `last_updated`:**
+   Resolved: `state.get("<entity>.last_updated")` → tz-aware UTC datetime; use `last_updated` not `last_reported`; read in the app via `_sensor_last_updated`, not `sensors.read_zone`.
+
+3. **Deadline sizing (`max_wait`):**
+   Resolved: `settle_max_wait_hours = 12.0`.
+
+4. **`settle_hours` vs sensor cadence:**
+   Resolved: `settle_hours` kept as minimum redistribution time; effective rule = first genuine report ≥ `settle_hours`.
+
+5. **New inconclusive/stale outcome routing:**
+   Resolved: expired obs is dropped; no `miss_streak`/convergence/efficacy change.
+
+**Poll cadence:** chosen as 30 min (`cron(*/30 * * * *)`).
 
 ## Safety notes (carry forward)
 
