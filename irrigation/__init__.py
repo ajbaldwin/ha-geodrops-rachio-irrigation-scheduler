@@ -51,7 +51,8 @@ STATE_DIR = "/config/pyscript/apps/irrigation/state"
 # Only records whose value is HISTORICAL. `irrigation_last_run` is "what just
 # happened" and `irrigation_status` is live, both of which the next run or the
 # startup handler re-establishes correctly.
-PERSISTED = ("irrigation_last_nightly", "irrigation_calibration")
+PERSISTED = ("irrigation_last_nightly", "irrigation_calibration",
+             "irrigation_targets", "irrigation_preview")
 # A planned nightly that is WAITING for its pre-dawn window holds its whole plan
 # in memory across a task.sleep of several hours. A restart during that sleep
 # loses it silently: nothing has watered, so the startup safety-stop finds no
@@ -1211,17 +1212,17 @@ def _end_anchor_time(anchor):
         return _dawn_time()
 
 
-def _plan_context(cfg):
-    """Evaluate zones and build the full plan — no execution. Shared by the
-    real run and the preview so both see identical decisions."""
-    tun = cfg.tunables
-    # pyscript's state.get raises NameError when the entity does not exist at all
-    # (vs. returning "unavailable" for a present-but-unknown entity). Treat a
-    # missing helper the same as an unknown value: fall back to Level 3 - Critical
-    # and warn to the system log — a missing helper is a misconfiguration, not
-    # routine operation. Deliberately NOT Level 4 - Emergency: that never waters,
-    # so a typo in the helper's options would silently let the lawn die. Level 3
-    # is the least-water profile that still waters.
+def _resolve_profile(cfg):
+    """(level, profile) for the current drought selection.
+
+    pyscript's state.get raises NameError when the entity does not exist at all
+    (vs. returning "unavailable" for a present-but-unknown entity). Treat a
+    missing helper the same as an unknown value: fall back to Level 3 - Critical
+    and warn to the system log — a missing helper is a misconfiguration, not
+    routine operation. Deliberately NOT Level 4 - Emergency: that never waters,
+    so a typo in the helper's options would silently let the lawn die. Level 3
+    is the least-water profile that still waters.
+    """
     try:
         level = state.get(cfg.bindings.drought_level_select)
     except NameError:
@@ -1234,6 +1235,47 @@ def _plan_context(cfg):
         )
         profile = cfg.drought_profiles["Level 3 - Critical"]
         level = "Level 3 - Critical"
+    return level, profile
+
+
+def _compute_target_floors(cfg):
+    """{zone_key: effective target floor} for online, non-excluded zones.
+
+    READ-ONLY, unlike _plan_context: it evaluates targets but never touches the
+    efficacy store (no exclusion stamping / recalibrate-on-return) and never
+    plans or waters. That is what makes it safe to call at startup or on demand
+    to hydrate the target-floor state without perturbing calibration.
+    """
+    _level, profile = _resolve_profile(cfg)
+    floors = {}
+    for key, zone in cfg.zones.items():
+        if _zone_excluded(zone):
+            continue
+        reading = sensors.read_zone(zone, _read_zone_signals(zone))
+        if not reading.online:
+            continue
+        floors[key] = round(drought.effective_target(zone, cfg.bands, profile).floor, 1)
+    return floors
+
+
+def _publish_targets(cfg):
+    """Publish per-zone target floors to pyscript.irrigation_targets (persisted),
+    so a Deficit sensor has a target the moment HA restarts — before the first
+    nightly plan. Refreshed at startup and each nightly. Read-only (see
+    _compute_target_floors)."""
+    floors = _compute_target_floors(cfg)
+    _publish_record("irrigation_targets", len(floors), {
+        "friendly_name": "Irrigation Target Floors",
+        "updated": dt.datetime.now().isoformat(timespec="seconds"),
+        "target_floors": floors,
+    })
+
+
+def _plan_context(cfg):
+    """Evaluate zones and build the full plan — no execution. Shared by the
+    real run and the preview so both see identical decisions."""
+    tun = cfg.tunables
+    level, profile = _resolve_profile(cfg)
     rng = random.Random()
 
     # Loaded before the zone loop so exclusion handling can stamp/reset it; the
@@ -1688,6 +1730,9 @@ def _plan_and_run(wait, trigger):
     _current_cfg = cfg
     _current_bindings = cfg.bindings
     _run_in_progress = True
+    # Keep the published target floors fresh each night (read-only; the floor
+    # shifts with drought level between runs).
+    _publish_targets(cfg)
     try:
         if _is_standby():
             # Record the standby note at the END of the potential watering window,
@@ -1933,9 +1978,10 @@ def _preview_body(cfg, stamp):
         msg = "System in Standby — a run would water nothing."
         _notify(msg, "Irrigation Preview")
         _activity("Preview: " + msg)
-        state.set(
-            "pyscript.irrigation_preview", value="standby",
-            new_attributes={"updated": stamp, "standby": True, "message": msg},
+        # Persisted so planned-runtime consumers survive a restart (see PERSISTED).
+        _publish_record(
+            "irrigation_preview", "standby",
+            {"updated": stamp, "standby": True, "message": msg},
         )
         return
 
@@ -2019,11 +2065,12 @@ def _preview_body(cfg, stamp):
             "overnight_wind_mph": fwx.wind_mph,
         }
 
-    # Full, untruncated breakdown — Developer Tools -> States.
-    state.set(
-        "pyscript.irrigation_preview",
-        value=len(the_plan.watered),
-        new_attributes={
+    # Full, untruncated breakdown — Developer Tools -> States. Persisted (see
+    # PERSISTED) so planned-runtime consumers keep a value across a restart.
+    _publish_record(
+        "irrigation_preview",
+        len(the_plan.watered),
+        {
             "updated": stamp,
             "drought_level": ctx["level"],
             "window_cap_hours": cap_hours,
@@ -2355,6 +2402,17 @@ def _on_startup():
     # restore pyscript entities, so without this a restart erases the evidence
     # for the very night someone is about to ask about.
     _restore_records()
+    # Recompute per-zone target floors now, so a Deficit sensor has a fresh
+    # target from the moment HA comes back — not only after the first nightly.
+    # Read-only (no efficacy writes), so it is safe outside the run window and
+    # must not gate on it. A load/sensor failure here must never take down the
+    # safety check below.
+    try:
+        _current_cfg = config.parse_config(task.executor(_read_config_yaml, CONFIG_PATH))
+        _current_bindings = _current_cfg.bindings
+        _publish_targets(_current_cfg)
+    except Exception as err:
+        log.warning(f"irrigation: startup target-floor publish skipped ({err})")
     # Time gate: only clean up during the overnight run window (~22:00-07:00).
     # A daytime restart must not stop a syringe / pet-cleanup run that shares a
     # managed zone. (Only managed zones are ever polled — see below.)
