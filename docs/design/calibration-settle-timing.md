@@ -1,4 +1,4 @@
-# Calibration settle timing — design note (unbuilt)
+# Calibration settle timing — design note
 
 Status: **implemented 2026-09-17** (see `docs/superpowers/plans/2026-09-17-calibration-settle-timing.md`). Captures the problem, the
 real hardware behaviour, the options considered, and resolutions to all feasibility questions.
