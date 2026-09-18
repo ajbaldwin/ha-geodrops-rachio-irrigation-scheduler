@@ -28,6 +28,34 @@ def evaluate_zone(reading: ZoneReading, target: EffectiveTarget) -> ZoneEvaluati
     )
 
 
+def revalidate_zone(online, dominant_now, dosing_source, floor, ceiling):
+    """Re-decide, at window start, whether a PLANNED zone should still water.
+
+    The nightly plan is built hours before the pre-dawn window; rain that lands
+    in the gap can raise a zone's moisture without being visible at plan time
+    (GeoDrops sensors report on a slow cadence). Given a FRESH reading, return a
+    drop reason, or None to keep the zone:
+
+    - sensor offline now -> None (fail-open; cannot prove the soil is wet, and
+      the plan already qualified the sensor).
+    - probe zone -> "saturated" if dominant_now >= ceiling
+      (probe_headroom_ceiling); a probe into saturated soil is rejected anyway.
+    - deficit zone -> "above-floor" if dominant_now >= floor; the trigger reason
+      (dominant below floor) is gone.
+
+    Boundary is inclusive (>=): a reading exactly at the line drops.
+    """
+    if not online:
+        return None
+    if dosing_source == "probe":
+        if dominant_now >= ceiling:
+            return "saturated"
+        return None
+    if dominant_now >= floor:
+        return "above-floor"
+    return None
+
+
 def sort_by_priority(evals: list, rng: random.Random) -> list:
     """Zones needing water, ordered by index deficit, then dominant-% deficit,
     then random.

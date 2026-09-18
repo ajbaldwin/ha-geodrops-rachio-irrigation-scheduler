@@ -1494,6 +1494,9 @@ def _plan_context(cfg):
         "doses": doses,
         "dosing_sources": dosing_sources,
         "dominant_by_zone": dominant_by_zone,
+        # Per-zone drought floor, for the window-start moisture re-check (which
+        # runs after the wait, without re-deriving the drought profile).
+        "floors": {k: targets[k].floor for k in targets},
     }
 
 
@@ -1649,6 +1652,10 @@ def _publish_last_run(stamp, trigger, ctx=None, result=None, outcome=None,
                 "last_reject_reason": crec.get("last_reject_reason"),
             }
         attributes["calibration"] = calibration_detail
+        # Zones the window-start moisture re-check pulled from the plan (rain that
+        # landed after planning). Absent when nothing was dropped.
+        if ctx.get("window_start_dropped"):
+            attributes["window_start_dropped"] = ctx["window_start_dropped"]
     if result is not None:
         attributes.update({
             "start": result.start, "end": result.end,
@@ -1857,6 +1864,69 @@ def _plan_and_run(wait, trigger):
                 _activity(f"Skipped at window start: {summary}")
                 _report(result, tun, event_time=ctx["end"])
                 return
+
+            # The plan's moisture readings were taken at ~23:00, but watering
+            # starts hours later. Rain that lands in the gap can raise a zone's
+            # moisture without being visible at plan time (GeoDrops sensors report
+            # on a slow cadence). Re-read live dominant for each zone about to
+            # water and drop any that no longer needs it — a calibration probe now
+            # at/above the saturation ceiling, or a deficit zone now at/above its
+            # floor. A dropped-to-empty plan takes the no-water path, like a rain
+            # skip. Mirrors the rain re-check above.
+            if the_plan.watered:
+                moisture_dropped = {}
+                for k in the_plan.watered:
+                    zc = cfg.zones[k]
+                    reading = sensors.read_zone(zc, _read_zone_signals(zc))
+                    reason = evaluate.revalidate_zone(
+                        reading.online, reading.dominant,
+                        ctx["dosing_sources"].get(k), ctx["floors"].get(k),
+                        tun.probe_headroom_ceiling,
+                    )
+                    if reason is not None:
+                        moisture_dropped[k] = {
+                            "reason": reason, "dominant": reading.dominant,
+                        }
+                if moisture_dropped:
+                    for k in moisture_dropped:
+                        uncompleted[k] = "moisture-risen"
+                    ctx["window_start_dropped"] = moisture_dropped
+                    survivors = [
+                        z for z in priority
+                        if z in the_plan.watered and z not in moisture_dropped
+                    ]
+                    geo = {z: cfg.zones[z].geography for z in survivors}
+                    adjacency = {z: cfg.zones[z].adjacency for z in survivors}
+                    surv_minutes = {z: ctx["minutes"][z] for z in survivors}
+                    the_plan = plan.build_plan(
+                        survivors, surv_minutes, geo, adjacency,
+                        ctx["cap_minutes"], tun,
+                    )
+                    for z in the_plan.dropped:
+                        uncompleted[z] = "insufficient window"
+                    detail_bits = []
+                    for k in moisture_dropped:
+                        md = moisture_dropped[k]
+                        detail_bits.append(
+                            f"{k} ({md['reason']}, dominant {md['dominant']})"
+                        )
+                    _activity(
+                        "Window-start re-check dropped: " + ", ".join(detail_bits)
+                    )
+                    if not the_plan.watered:
+                        result = report_format.RunResult(
+                            watered=[], uncompleted=uncompleted,
+                            start="", end="", per_zone_minutes={}, standby=False,
+                            window_start=ctx["earliest_start"].astimezone().strftime("%H:%M"),
+                            window_end=ctx["end"].astimezone().strftime("%H:%M"),
+                            window_hours=round(ctx["cap_minutes"] / 60.0, 2),
+                        )
+                        _publish_last_run(stamp, trigger, ctx=ctx, result=result,
+                                          skipped="moisture-risen")
+                        _set_status("skipped", detail="soil already wet at window start")
+                        _activity("Skipped at window start: soil already wet")
+                        _report(result, tun, event_time=ctx["end"])
+                        return
 
         zone_switches = {k: cfg.zones[k].rachio_switch for k in the_plan.watered}
         # When watering ACTUALLY begins, which is not the planned start. For a
