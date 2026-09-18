@@ -1,5 +1,12 @@
 # GeoDrops + Rachio Irrigation Scheduler
 
+> **⚠️ Archived.** This scheduler now lives inside the HACS-installable
+> integration
+> **[ha-geodrops-rachio-irrigation](https://github.com/ajbaldwin/ha-geodrops-rachio-irrigation)**,
+> which wraps it with a Home Assistant config-flow UI and ships it as one
+> package. Development continues there; this standalone repo is read-only and no
+> longer released. Its history remains available here for reference.
+
 A [pyscript](https://github.com/custom-components/pyscript) app for Home
 Assistant that runs your Rachio sprinkler zones based on real soil-moisture
 readings instead of a fixed clock.
