@@ -70,49 +70,82 @@ def test_should_probe():
     assert calibration.should_probe("calibrating", 90.0, False, t) is False # no headroom
 
 
-import datetime as _dt
+import datetime as dt
 
 
 def _t(h):
-    # tz-aware helper: a fixed base datetime plus h hours (UTC).
-    base = _dt.datetime(2026, 9, 17, 0, 0, tzinfo=_dt.timezone.utc)
-    return base + _dt.timedelta(hours=h)
+    return dt.datetime(2026, 9, 17, 6, 0, tzinfo=dt.timezone.utc) + dt.timedelta(hours=h)
 
 
-def test_settle_decision_waits_before_ripe():
-    # now < measure_at -> not ripe yet, regardless of freshness
-    assert calibration.settle_decision(_t(3), _t(4), _t(5), 12.0) == "wait"
+# --- settle_decision (accumulate model) ---
+def test_settle_decision_accumulates_before_finalize():
+    # run_end=_t(0), retain_hours=6 -> finalize at _t(6)
+    assert calibration.settle_decision(_t(3), _t(0), 6.0, 12.0, True) == "accumulate"
+    assert calibration.settle_decision(_t(3), _t(0), 6.0, 12.0, False) == "accumulate"
 
+def test_settle_decision_finalizes_when_ripe_with_sample():
+    assert calibration.settle_decision(_t(6), _t(0), 6.0, 12.0, True) == "finalize"   # boundary
+    assert calibration.settle_decision(_t(9), _t(0), 6.0, 12.0, True) == "finalize"
 
-def test_settle_decision_measures_when_ripe_and_fresh():
-    # ripe (now >= measure_at) and a genuine post-settle sample (last_updated >= measure_at)
-    assert calibration.settle_decision(_t(5), _t(4), _t(4), 12.0) == "measure"     # boundary: last_updated == measure_at
-    assert calibration.settle_decision(_t(6), _t(4), _t(5), 12.0) == "measure"
+def test_settle_decision_waits_past_finalize_without_sample_then_expires():
+    # past finalize (_t6) but within grace (+12h -> _t18): still accumulate, hoping for a sample
+    assert calibration.settle_decision(_t(10), _t(0), 6.0, 12.0, False) == "accumulate"
+    # at/after finalize+max_wait (_t18) with no sample ever -> expired
+    assert calibration.settle_decision(_t(18), _t(0), 6.0, 12.0, False) == "expired"   # boundary
+    assert calibration.settle_decision(_t(20), _t(0), 6.0, 12.0, False) == "expired"
 
+def test_settle_decision_sample_finalizes_even_past_grace():
+    assert calibration.settle_decision(_t(20), _t(0), 6.0, 12.0, True) == "finalize"
 
-def test_settle_decision_waits_when_ripe_but_stale():
-    # ripe but the only sample predates measure_at, still before the deadline
-    assert calibration.settle_decision(_t(6), _t(4), _t(1), 12.0) == "wait"
-    # sensor last_updated unreadable -> treated as not fresh
-    assert calibration.settle_decision(_t(6), _t(4), None, 12.0) == "wait"
+# --- accumulate_sample ---
+def test_accumulate_first_sample_sets_peak_not_retained_before_settle():
+    # now=_t(1) < run_end+settle(4) -> retained stays None, peak set
+    peak, ret, seen, ch = calibration.accumulate_sample(
+        None, None, None, 85.0, _t(1), _t(1), _t(0), 4.0)
+    assert (peak, ret, ch) == (85.0, None, True) and seen == _t(1)
 
+def test_accumulate_running_max_and_retained_after_settle():
+    # second sample lower value but after settle -> peak holds, retained updates
+    peak, ret, seen, ch = calibration.accumulate_sample(
+        85.0, None, _t(1), 82.0, _t(5), _t(5), _t(0), 4.0)
+    assert (peak, ret, ch) == (85.0, 82.0, True) and seen == _t(5)
+    # a higher later sample raises peak and updates retained
+    peak, ret, seen, ch = calibration.accumulate_sample(
+        85.0, 82.0, _t(5), 88.0, _t(6), _t(6), _t(0), 4.0)
+    assert (peak, ret, seen, ch) == (88.0, 88.0, _t(6), True)
 
-def test_settle_decision_expires_at_deadline_without_fresh_sample():
-    # deadline = measure_at + max_wait = _t(4) + 12h = _t(16)
-    assert calibration.settle_decision(_t(16), _t(4), _t(1), 12.0) == "expired"   # boundary: now == deadline
-    assert calibration.settle_decision(_t(20), _t(4), None, 12.0) == "expired"
+def test_accumulate_ignores_stale_republish_and_missing():
+    # last_updated not newer than last_seen -> no change (stale MQTT republish)
+    assert calibration.accumulate_sample(85.0, 82.0, _t(5), 99.0, _t(5), _t(6), _t(0), 4.0) == (85.0, 82.0, _t(5), False)
+    # None value/last_updated -> no change
+    assert calibration.accumulate_sample(85.0, 82.0, _t(5), None, _t(6), _t(6), _t(0), 4.0) == (85.0, 82.0, _t(5), False)
 
+# --- retention_factor ---
+def test_retention_factor_and_clamps():
+    assert calibration.retention_factor(80.0, 92.0, 84.0, 0.1) == pytest.approx((84-80)/(92-80))  # 0.333
+    assert calibration.retention_factor(80.0, 92.0, 120.0, 0.1) == 1.0        # clamp high
+    assert calibration.retention_factor(80.0, 92.0, 80.0, 0.1) == 0.1         # fully drained -> floor
+    assert calibration.retention_factor(80.0, 80.0, 84.0, 0.1) is None        # peak<=pre -> None
+    assert calibration.retention_factor(80.0, 92.0, None, 0.1) is None        # no retained -> None
 
-def test_settle_decision_measures_even_past_deadline_if_fresh():
-    # a fresh sample always wins over the deadline (we can still learn)
-    assert calibration.settle_decision(_t(20), _t(4), _t(18), 12.0) == "measure"
+# --- retained_span ---
+def test_retained_span_applies_r_and_clamps():
+    assert calibration.retained_span(0.5, 0.4, 60.0, 1.0, 60.0) == pytest.approx(12.0)   # .5*.4*60
+    assert calibration.retained_span(0.5, None, 60.0, 1.0, 60.0) == pytest.approx(30.0)  # r None -> 1.0
+    assert calibration.retained_span(2.0, 1.0, 60.0, 1.0, 60.0) == 60.0                  # clamp high
+    assert calibration.retained_span(0.001, 0.1, 60.0, 1.0, 60.0) == 1.0                 # clamp low
+
+# --- ewma ---
+def test_ewma():
+    assert calibration.ewma(None, 0.4, 0.3) == 0.4               # bootstrap
+    assert calibration.ewma(0.5, 0.4, 0.3) == pytest.approx(0.3*0.4 + 0.7*0.5)
 
 
 def test_exclusion_return_resets_after_threshold():
-    now = _dt.datetime(2026, 9, 20, 12, 0, 0)
+    now = dt.datetime(2026, 9, 20, 12, 0, 0)
     rec = {"state": "converged", "efficacy": 0.5, "span_pts": 20.0,
            "recent": [0.5, 0.5, 0.5], "miss_streak": 0, "n_obs": 5,
-           "excluded_since": _dt.datetime(2026, 9, 17, 12, 0, 0).isoformat()}  # 72h
+           "excluded_since": dt.datetime(2026, 9, 17, 12, 0, 0).isoformat()}  # 72h
     out = calibration.exclusion_return(rec, now, 48.0)
     assert out["state"] == "recalibrating"
     assert out["efficacy"] is None
@@ -123,9 +156,9 @@ def test_exclusion_return_resets_after_threshold():
 
 
 def test_exclusion_return_keeps_below_threshold():
-    now = _dt.datetime(2026, 9, 20, 12, 0, 0)
+    now = dt.datetime(2026, 9, 20, 12, 0, 0)
     rec = {"state": "converged", "efficacy": 0.5, "span_pts": 20.0,
-           "excluded_since": _dt.datetime(2026, 9, 20, 0, 0, 0).isoformat()}  # 12h
+           "excluded_since": dt.datetime(2026, 9, 20, 0, 0, 0).isoformat()}  # 12h
     out = calibration.exclusion_return(rec, now, 48.0)
     assert out["state"] == "converged"
     assert out["efficacy"] == 0.5
@@ -134,14 +167,14 @@ def test_exclusion_return_keeps_below_threshold():
 
 
 def test_exclusion_return_no_stamp_is_noop():
-    now = _dt.datetime(2026, 9, 20, 12, 0, 0)
+    now = dt.datetime(2026, 9, 20, 12, 0, 0)
     rec = {"state": "converged", "efficacy": 0.5}
     out = calibration.exclusion_return(rec, now, 48.0)
     assert out == {"state": "converged", "efficacy": 0.5}
 
 
 def test_exclusion_return_malformed_stamp_clears_keeps():
-    now = _dt.datetime(2026, 9, 20, 12, 0, 0)
+    now = dt.datetime(2026, 9, 20, 12, 0, 0)
     rec = {"state": "converged", "efficacy": 0.5, "excluded_since": "not-a-date"}
     out = calibration.exclusion_return(rec, now, 48.0)
     assert out["state"] == "converged"

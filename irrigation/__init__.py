@@ -1915,7 +1915,6 @@ def _plan_and_run(wait, trigger):
         # exactly the nights that go wrong, so nothing fragile runs ahead of them.
         _publish_last_run(stamp, trigger, ctx=ctx, result=result, outcome=outcome)
         if tun.self_calibration_enabled and watered:
-            measure_at = finished + dt.timedelta(hours=tun.settle_hours)
             pend = []
             for k in watered:
                 pend.append({
@@ -1923,7 +1922,10 @@ def _plan_and_run(wait, trigger):
                     "pre_dominant": ctx["dominant_by_zone"].get(k),
                     "minutes": delivered.get(k, 0),
                     "run_end_iso": finished.isoformat(),
-                    "measure_at_iso": measure_at.isoformat(),
+                    # Accumulator (peak + retained) filled by the settle poll.
+                    "peak": None,
+                    "retained": None,
+                    "last_seen_updated": None,
                 })
             _append_pending_obs(pend)
         _log_zone_outcomes(cfg, watered, delivered, uncompleted)
@@ -2311,23 +2313,48 @@ def _settle_and_learn():
     dropped = 0
     for rec in pending:
         try:
-            measure_at = dt.datetime.fromisoformat(rec["measure_at_iso"])
+            run_end = dt.datetime.fromisoformat(rec["run_end_iso"])
         except (KeyError, ValueError):
             continue
         zone = rec.get("zone")
         zone_cfg = cfg.zones.get(zone)
         if zone_cfg is None:
             continue  # obs for a zone no longer configured: drop it
-        last_updated = _sensor_last_updated(zone_cfg.dominant_sensor)
-        decision = calibration.settle_decision(
-            now, measure_at, last_updated, tun.settle_max_wait_hours)
-        if decision == "wait":
+        try:
+            # --- accumulate this poll's reading into the obs (freshness-gated) ---
+            signals = _read_zone_signals(zone_cfg)
+            reading = sensors.read_zone(zone_cfg, signals)
+            value = reading.dominant if reading.online else None
+            last_updated = _sensor_last_updated(zone_cfg.dominant_sensor)
+            try:
+                last_seen = (dt.datetime.fromisoformat(rec["last_seen_updated"])
+                             if rec.get("last_seen_updated") else None)
+            except ValueError:
+                last_seen = None
+            peak, retained, last_seen, _ch = calibration.accumulate_sample(
+                rec.get("peak"), rec.get("retained"), last_seen,
+                value, last_updated, now, run_end, tun.settle_hours)
+            rec["peak"] = peak
+            rec["retained"] = retained
+            rec["last_seen_updated"] = last_seen.isoformat() if last_seen else None
+            # --- decide ---
+            decision = calibration.settle_decision(
+                now, run_end, tun.retain_hours, tun.settle_max_wait_hours,
+                peak is not None)
+        except Exception as err:
+            # A single zone's missing/renamed sensor (or any other accumulate
+            # failure) must not abort the whole poll and must not drop the
+            # observation — keep it for the next poll to retry.
+            log.warning(f"irrigation: settle-and-learn skipped a record ({err})")
+            remaining.append(rec)
+            continue
+        if decision == "accumulate":
             remaining.append(rec)
             continue
         if decision == "expired":
             dropped += 1
             continue  # inconclusive: drop, never reject, no model change
-        # decision == "measure": fall through to the accept/reject path below
+        # decision == "finalize"
         if api_runtimes is None:
             api_runtimes = get_runtimes()
             rained = _rained_since_run(cfg.bindings, tun)
@@ -2336,30 +2363,30 @@ def _settle_and_learn():
             minutes = rec.get("minutes")
             if pre is None or not minutes:
                 continue
-            signals = _read_zone_signals(zone_cfg)
-            reading = sensors.read_zone(zone_cfg, signals)
             quals = [(q or "").strip() for q in signals.qualities]
             qcn_training = (len(quals) == 3 and quals[0] == "Training"
                             and quals[1] == "Training" and quals[2] == "Training")
-            sensor_ok = reading.online
-            settled = reading.dominant if reading.online else pre
+            # settled_dominant = PEAK: classify's no_rise (rise<=0) and saturated
+            # (>=95) both key off the max the soil reached.
             obs = calibration.Observation(
                 zone=zone, pre_dominant=pre, minutes=minutes,
-                settled_dominant=settled, qcn_training=qcn_training,
-                rained=rained, sensor_ok=sensor_ok,
+                settled_dominant=peak, qcn_training=qcn_training,
+                rained=rained, sensor_ok=True,
             )
             reason = calibration.classify(obs, tun)
             zrec = store.get(zone) or {}
             if reason == "ok":
                 prev = zrec.get("efficacy")
-                eff = calibration.update_efficacy(prev, obs, tun)
-                eff_obs = (settled - pre) / minutes
+                eff = calibration.update_efficacy(prev, obs, tun)   # peak rate
+                eff_obs = (peak - pre) / minutes
                 recent = (zrec.get("recent") or []) + [eff_obs]
                 if len(recent) > tun.convergence_samples:
                     recent = recent[-tun.convergence_samples:]
+                r_obs = calibration.retention_factor(pre, peak, retained, tun.retention_floor)
+                prev_r = zrec.get("retention")
+                r = prev_r if r_obs is None else calibration.ewma(prev_r, r_obs, tun.calibration_ewma_alpha)
                 base = api_runtimes.get(zone_cfg.rachio_zone_id) or zone_cfg.runtime_minutes
-                span = calibration.efficacy_to_span(eff, base)
-                span = max(tun.span_min, min(tun.span_max, span))
+                span = calibration.retained_span(eff, r, base, tun.span_min, tun.span_max)
                 miss = zrec.get("miss_streak") or 0
                 if prev and prev > 0 and abs(eff_obs - prev) / prev > tun.convergence_tolerance:
                     miss = miss + 1
@@ -2369,9 +2396,10 @@ def _settle_and_learn():
                 state_name = calibration.next_state(
                     zrec.get("state", "calibrating"), conv, False, miss, tun)
                 zrec = {
-                    "state": state_name, "efficacy": eff, "span_pts": span,
-                    "recent": recent, "n_obs": (zrec.get("n_obs") or 0) + 1,
-                    "prior_minutes": minutes, "last_rise": (settled - pre),
+                    "state": state_name, "efficacy": eff, "retention": r,
+                    "span_pts": span, "recent": recent,
+                    "n_obs": (zrec.get("n_obs") or 0) + 1,
+                    "prior_minutes": minutes, "last_rise": (peak - pre),
                     "miss_streak": miss,
                     "last_updated": now.isoformat(), "last_reject_reason": None,
                 }
@@ -2385,7 +2413,7 @@ def _settle_and_learn():
                 zrec["miss_streak"] = 0
                 zrec["last_reject_reason"] = reason
             else:
-                zrec = calibration.apply_reject(zrec, reason, minutes, settled - pre, tun)
+                zrec = calibration.apply_reject(zrec, reason, minutes, peak - pre, tun)
             store[zone] = zrec
         except Exception as err:
             log.warning(f"irrigation: settle-and-learn skipped a record ({err})")
