@@ -54,9 +54,9 @@ restart):
   counted, so a stale 15-minute MQTT republish (same value, unchanged
   `last_updated`) is never double-counted.
 
-Existing fields unchanged: `zone`, `pre_dominant`, `minutes`, `run_end_iso`,
-`measure_at_iso`. `measure_at_iso` is repurposed to the **finalize** time
-`run_end + retain_hours` (see Timing).
+Existing fields unchanged: `zone`, `pre_dominant`, `minutes`, `run_end_iso`.
+The old `measure_at_iso` field is dropped — the finalize time is derived from
+`run_end_iso + retain_hours` at poll time (see Timing).
 
 **Efficacy store** (`irrigation_efficacy.json`) per-zone record gains:
 
