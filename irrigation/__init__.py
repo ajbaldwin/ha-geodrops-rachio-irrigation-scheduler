@@ -1915,7 +1915,6 @@ def _plan_and_run(wait, trigger):
         # exactly the nights that go wrong, so nothing fragile runs ahead of them.
         _publish_last_run(stamp, trigger, ctx=ctx, result=result, outcome=outcome)
         if tun.self_calibration_enabled and watered:
-            measure_at = finished + dt.timedelta(hours=tun.retain_hours)
             pend = []
             for k in watered:
                 pend.append({
@@ -1923,7 +1922,6 @@ def _plan_and_run(wait, trigger):
                     "pre_dominant": ctx["dominant_by_zone"].get(k),
                     "minutes": delivered.get(k, 0),
                     "run_end_iso": finished.isoformat(),
-                    "measure_at_iso": measure_at.isoformat(),
                     # Accumulator (peak + retained) filled by the settle poll.
                     "peak": None,
                     "retained": None,
@@ -2322,26 +2320,34 @@ def _settle_and_learn():
         zone_cfg = cfg.zones.get(zone)
         if zone_cfg is None:
             continue  # obs for a zone no longer configured: drop it
-        # --- accumulate this poll's reading into the obs (freshness-gated) ---
-        signals = _read_zone_signals(zone_cfg)
-        reading = sensors.read_zone(zone_cfg, signals)
-        value = reading.dominant if reading.online else None
-        last_updated = _sensor_last_updated(zone_cfg.dominant_sensor)
         try:
-            last_seen = (dt.datetime.fromisoformat(rec["last_seen_updated"])
-                         if rec.get("last_seen_updated") else None)
-        except ValueError:
-            last_seen = None
-        peak, retained, last_seen, _ch = calibration.accumulate_sample(
-            rec.get("peak"), rec.get("retained"), last_seen,
-            value, last_updated, now, run_end, tun.settle_hours)
-        rec["peak"] = peak
-        rec["retained"] = retained
-        rec["last_seen_updated"] = last_seen.isoformat() if last_seen else None
-        # --- decide ---
-        decision = calibration.settle_decision(
-            now, run_end, tun.retain_hours, tun.settle_max_wait_hours,
-            peak is not None)
+            # --- accumulate this poll's reading into the obs (freshness-gated) ---
+            signals = _read_zone_signals(zone_cfg)
+            reading = sensors.read_zone(zone_cfg, signals)
+            value = reading.dominant if reading.online else None
+            last_updated = _sensor_last_updated(zone_cfg.dominant_sensor)
+            try:
+                last_seen = (dt.datetime.fromisoformat(rec["last_seen_updated"])
+                             if rec.get("last_seen_updated") else None)
+            except ValueError:
+                last_seen = None
+            peak, retained, last_seen, _ch = calibration.accumulate_sample(
+                rec.get("peak"), rec.get("retained"), last_seen,
+                value, last_updated, now, run_end, tun.settle_hours)
+            rec["peak"] = peak
+            rec["retained"] = retained
+            rec["last_seen_updated"] = last_seen.isoformat() if last_seen else None
+            # --- decide ---
+            decision = calibration.settle_decision(
+                now, run_end, tun.retain_hours, tun.settle_max_wait_hours,
+                peak is not None)
+        except Exception as err:
+            # A single zone's missing/renamed sensor (or any other accumulate
+            # failure) must not abort the whole poll and must not drop the
+            # observation — keep it for the next poll to retry.
+            log.warning(f"irrigation: settle-and-learn skipped a record ({err})")
+            remaining.append(rec)
+            continue
         if decision == "accumulate":
             remaining.append(rec)
             continue
