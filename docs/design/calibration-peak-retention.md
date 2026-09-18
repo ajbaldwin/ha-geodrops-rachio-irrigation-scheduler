@@ -1,6 +1,6 @@
 # Calibration peak + retention (hybrid efficacy) — design
 
-Status: **approved 2026-09-18, not yet implemented.** Extends
+Status: **implemented 2026-09-18** (see docs/superpowers/plans/2026-09-18-calibration-peak-retention.md). Extends
 `calibration-settle-timing.md` (the freshness-gated settle poll shipped in
 v0.8.4). This note adds *what* the settle poll measures; that note fixed *when*.
 
@@ -168,8 +168,10 @@ runs the accept branch; dosing reads `retention`.
 
 ## Open items (resolve in the plan)
 
-- Exact dosing seam in `dosing.py` (where `efficacy`/span becomes runtime) and
-  how `retention` threads to it.
+- The retained span is stored in `span_pts` at finalize (`efficacy × r × base`,
+  clamped), so `dosing.dose_zone` and `_plan_context` are unchanged — the
+  existing learned-span path (the `eff["span_pts"]` branch in
+  `irrigation/__init__.py`) reads it directly.
 - Whether `retained` should be the last sample before finalize or a small
   median of post-`settle_hours` samples (extra state vs. noise); default to
   last-sample, revisit if `r` proves jumpy.
