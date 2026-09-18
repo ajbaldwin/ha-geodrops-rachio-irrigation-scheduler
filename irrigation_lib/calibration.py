@@ -227,30 +227,80 @@ def should_probe(state: str, dominant_now: float, pinned: bool, t) -> bool:
     return True
 
 
-def settle_decision(now, measure_at, last_updated, max_wait_hours) -> str:
-    """Decide how to handle one pending calibration observation at this poll.
+def settle_decision(now, run_end, retain_hours, max_wait_hours, has_sample) -> str:
+    """Decide how to handle one pending calibration obs at this poll.
 
-    All datetimes are tz-aware (aware/aware comparisons only). `last_updated` is
-    the dominant sensor's HA last_updated (bumps on a value change, so it tracks
-    genuine device check-ins) or None when it cannot be read.
+    Accumulate model: the poll folds each genuine reading into the obs (peak +
+    retained) until finalize. All datetimes tz-aware.
 
     Returns:
-      "wait"     - not ripe yet (now < measure_at), OR ripe but no genuine
-                   post-settle sample (last_updated < measure_at or None) and the
-                   deadline has not passed. Keep the obs pending.
-      "measure"  - ripe AND a genuine post-settle sample exists
-                   (last_updated >= measure_at). Read + classify it.
-      "expired"  - ripe, still no fresh sample, and now >= measure_at + max_wait.
-                   Drop the obs (never reject, never touch the model).
+      "accumulate" - before finalize (now < run_end + retain_hours), OR past it
+                     with no genuine sample yet but still within the grace
+                     window. Keep the obs pending and keep collecting.
+      "finalize"   - now >= run_end + retain_hours AND at least one genuine
+                     sample was captured (has_sample). Compute + accept.
+      "expired"    - past finalize + max_wait_hours with no sample ever. Drop
+                     the obs (never reject, never touch the model).
 
-    A fresh sample always yields "measure", even past the deadline: if we can
-    learn cleanly we should, regardless of how long it took to arrive.
+    A captured sample always finalizes once ripe, even past the grace window.
     """
-    if now < measure_at:
-        return "wait"
-    if last_updated is not None and last_updated >= measure_at:
-        return "measure"
-    deadline = measure_at + dt.timedelta(hours=max_wait_hours)
-    if now >= deadline:
+    finalize_at = run_end + dt.timedelta(hours=retain_hours)
+    if now < finalize_at:
+        return "accumulate"
+    if has_sample:
+        return "finalize"
+    if now >= finalize_at + dt.timedelta(hours=max_wait_hours):
         return "expired"
-    return "wait"
+    return "accumulate"
+
+
+def accumulate_sample(peak, retained, last_seen, value, last_updated,
+                      now, run_end, settle_hours):
+    """Fold one candidate sensor reading into an obs accumulator.
+
+    Counts only a genuinely new report (last_updated strictly newer than
+    last_seen — a stale MQTT republish carries the same last_updated). peak is
+    the running max from run_end on; retained is the latest reading at/after
+    run_end + settle_hours. Returns (peak, retained, last_seen, changed).
+    """
+    if value is None or last_updated is None:
+        return peak, retained, last_seen, False
+    if last_seen is not None and last_updated <= last_seen:
+        return peak, retained, last_seen, False
+    new_peak = value if peak is None else max(peak, value)
+    new_ret = retained
+    if now >= run_end + dt.timedelta(hours=settle_hours):
+        new_ret = value
+    return new_peak, new_ret, last_updated, True
+
+
+def retention_factor(pre, peak, retained, floor):
+    """r = (retained - pre) / (peak - pre), clamped to [floor, 1.0].
+
+    None when it cannot be computed: no retained sample, or peak did not rise
+    above pre (peak_rise <= 0).
+    """
+    if retained is None:
+        return None
+    peak_rise = peak - pre
+    if peak_rise <= 0:
+        return None
+    r = (retained - pre) / peak_rise
+    return max(floor, min(1.0, r))
+
+
+def retained_span(efficacy, retention, base, span_min, span_max):
+    """Dominant points a full refill RETAINS = efficacy(peak) * r * base, clamped.
+
+    retention None (pre-retention) is treated as 1.0 (peak span).
+    """
+    r = 1.0 if retention is None else retention
+    span = efficacy * r * base
+    return max(span_min, min(span_max, span))
+
+
+def ewma(prev, value, alpha):
+    """Exponentially-weighted blend; bootstraps to value when prev is None."""
+    if prev is None:
+        return value
+    return alpha * value + (1 - alpha) * prev

@@ -91,6 +91,14 @@ class Tunables:
     # so a missed GeoDrops check-in can't corrupt the model. Sized to clear the
     # observed worst-case ~6h missed check-in plus settle.
     settle_max_wait_hours: float = 12.0
+    # When a calibration observation is finalized (retained reading captured,
+    # obs accepted). Must exceed settle_hours: peak accumulates from run_end, but
+    # the retained reading is only taken from settle_hours on, and finalize waits
+    # until the soil has settled (retain_hours).
+    retain_hours: float = 6.0
+    # Lower clamp for the retention factor r (retained_rise / peak_rise). Keeps a
+    # fully-drained night from zeroing the dosing span.
+    retention_floor: float = 0.1
     # EWMA smoothing factor for calibration convergence.
     calibration_ewma_alpha: float = 0.3
     # Tolerance threshold for convergence detection.

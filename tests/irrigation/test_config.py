@@ -351,3 +351,11 @@ def test_zone_exclude_boolean_default_and_override():
     c = config.parse_config(raw)
     assert c.zones["zone_a"].exclude_boolean == "input_boolean.irrigation_exclude_zone_a"
     assert c.zones["zone_b"].exclude_boolean == ""  # default when key omitted
+
+
+def test_retain_and_retention_floor_defaults():
+    from irrigation_lib.config import Tunables
+    t = Tunables()
+    assert t.retain_hours == 6.0
+    assert t.retention_floor == 0.1
+    assert t.retain_hours > t.settle_hours   # finalize must be after the retained floor
